@@ -68,7 +68,10 @@ async fn main() -> Result<()> {
     if args.print_config {
         let provider_name = upstream
             .host_str()
-            .map(|h| h.trim_start_matches("api.").trim_start_matches("www."))
+            .map(|h| {
+            let h = h.trim_start_matches("api.").trim_start_matches("www.");
+            h.trim_end_matches(".com").trim_end_matches(".cn").trim_end_matches(".ai").trim_end_matches(".org").trim_end_matches(".io")
+        })
             .unwrap_or("custom");
         print_codex_config(&client, &upstream, &api_key, provider_name).await;
         return Ok(());
@@ -217,13 +220,13 @@ async fn print_codex_config(
     println!("[model_providers.{provider_name}]");
     println!("name = \"{}\"", provider_name);
     println!(
-        "base_url = \"{}v1\"",
+        "base_url = \"{}\"",
         upstream.as_str().trim_end_matches('/')
     );
     println!("wire_api = \"responses\"");
     println!(
         "env_key = \"{}_API_KEY\"",
-        provider_name.to_uppercase().replace('-', "_")
+        provider_name.to_uppercase().replace('-', "_").replace('.', "_")
     );
     println!();
 
