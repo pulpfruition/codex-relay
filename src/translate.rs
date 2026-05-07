@@ -97,6 +97,12 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
                                 name: None,
                             });
                         }
+                        // Codex 0.128+ may replay reasoning items in input history.
+                        // Reasoning round-trip is handled separately by the session
+                        // store (call_id and turn-level fingerprint indexes), not via
+                        // input items — drop these so they don't pollute as empty
+                        // user messages in the catch-all branch.
+                        "reasoning" => {}
                         _ => {
                             // Regular user/assistant/developer message
                             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
@@ -132,16 +138,37 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
     ChatRequest {
         model: req.model.clone(),
         messages,
-        // Keep only `function` tools; providers like DeepSeek don't accept
-        // OpenAI-proprietary built-ins (web_search, computer, file_search, …).
-        tools: req.tools.iter()
-            .filter(|t| t.get("type").and_then(Value::as_str) == Some("function"))
-            .map(convert_tool)
-            .collect(),
+        tools: convert_tools(&req.tools),
         temperature: req.temperature,
         max_tokens: req.max_output_tokens,
         stream: req.stream,
     }
+}
+
+/// Flatten Responses-API tools into Chat Completions tools.
+///
+/// - `function` → keep, normalize shape
+/// - `namespace` (Codex 0.128+ MCP plugin grouping) → splice in each child function
+/// - `web_search`, `image_generation`, `computer`, `file_search`, … → drop;
+///   non-OpenAI providers reject these built-ins.
+fn convert_tools(tools: &[Value]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(tools.len());
+    for tool in tools {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("function") => out.push(convert_tool(tool)),
+            Some("namespace") => {
+                if let Some(subs) = tool.get("tools").and_then(Value::as_array) {
+                    for sub in subs {
+                        if sub.get("type").and_then(Value::as_str) == Some("function") {
+                            out.push(convert_tool(sub));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Responses API tool format → Chat Completions tool format.

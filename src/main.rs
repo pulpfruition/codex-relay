@@ -96,7 +96,8 @@ fn join_base(url: &Url) -> String {
     if s.ends_with('/') { s.to_string() } else { format!("{s}/") }
 }
 
-/// GET /v1/models — proxy to upstream so Codex gets real model metadata.
+/// GET /v1/models — proxy to upstream and normalize so both legacy
+/// (`{data:[...]}`) and Codex 0.128+ (`{models:[...]}`) consumers are happy.
 async fn handle_models(State(state): State<AppState>) -> Response {
     info!("GET /v1/models");
     let url = format!("{}models", join_base(&state.upstream));
@@ -104,25 +105,29 @@ async fn handle_models(State(state): State<AppState>) -> Response {
     if !state.api_key.is_empty() {
         builder = builder.bearer_auth(state.api_key.as_str());
     }
-    match builder.send().await {
-        Ok(r) if r.status().is_success() => {
-            match r.json::<serde_json::Value>().await {
-                Ok(body) => Json(body).into_response(),
-                Err(e) => {
-                    warn!("upstream models: parse error: {e}");
-                    Json(serde_json::json!({ "object": "list", "data": [] })).into_response()
-                }
-            }
-        }
-        Ok(r) => {
-            warn!("upstream models: status {}", r.status());
-            Json(serde_json::json!({ "object": "list", "data": [] })).into_response()
-        }
-        Err(e) => {
-            warn!("upstream models: request error: {e}");
-            Json(serde_json::json!({ "object": "list", "data": [] })).into_response()
-        }
-    }
+
+    let upstream_body: Option<serde_json::Value> = match builder.send().await {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(b) => Some(b),
+            Err(e) => { warn!("upstream models: parse error: {e}"); None }
+        },
+        Ok(r) => { warn!("upstream models: status {}", r.status()); None }
+        Err(e) => { warn!("upstream models: request error: {e}"); None }
+    };
+
+    let list = upstream_body
+        .as_ref()
+        .and_then(|b| b.get("data").or_else(|| b.get("models")))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    Json(serde_json::json!({
+        "object": "list",
+        "data": list.clone(),
+        "models": list,
+    }))
+    .into_response()
 }
 
 /// Catch-all: log unknown requests so we can see what Codex is sending.
