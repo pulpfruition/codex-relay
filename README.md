@@ -27,7 +27,26 @@ CODEX_RELAY_PORT=4446 \
 codex-relay
 ```
 
-**2. Configure Codex** (`~/.codex/config.toml`)
+On startup, the relay logs the available upstream models and prints a hint:
+
+```
+ℹ upstream models: deepseek-chat, deepseek-reasoner
+⚠  To configure Codex with model metadata, run:  codex-relay --print-config --upstream ...
+```
+
+**2. Generate your Codex config**
+
+```bash
+codex-relay --print-config \
+  --upstream https://api.deepseek.com/v1 \
+  --api-key $DEEPSEEK_API_KEY
+```
+
+This prints a ready-to-use `~/.codex/config.toml` snippet that includes
+`model_properties` for every upstream model, so Codex knows model capabilities
+and you won't see the **"Model metadata … not found"** warning.
+
+If you prefer to write the config by hand, here is the minimal form:
 
 ```toml
 model = "deepseek-chat"
@@ -35,11 +54,34 @@ model_provider = "deepseek-relay"
 
 [model_providers.deepseek-relay]
 name = "DeepSeek"
-api_base_url = "http://127.0.0.1:4446/v1"
+base_url = "http://127.0.0.1:4446/v1"
+wire_api = "responses"
 env_key = "DEEPSEEK_API_KEY"
+
+[model_properties."deepseek-chat"]
+context_window = 262144
+max_context_window = 1048576
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = false
+input_modalities = ["text"]
 ```
 
+> ⚠️ **Without `model_properties`**, Codex CLI defaults to fallback metadata
+> for any model it doesn't recognize natively. This can degrade performance,
+> tool-call reliability, and context-window management. The relay logs a
+> reminder at startup and offers `--print-config` to eliminate this class
+> of problem entirely.
+
 **3. Use Codex normally** — it routes through the relay transparently.
+
+## CLI reference
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--port` | `CODEX_RELAY_PORT` | `4444` | Listen port |
+| `--upstream` | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
+| `--api-key` | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
+| `--print-config` | _(none)_ | — | Print a Codex config snippet with `model_properties` and exit |
 
 ## Supported providers
 
@@ -62,6 +104,7 @@ Any OpenAI-compatible endpoint works.
 - **Parallel tool calls** — consecutive function_call input items merged into one assistant message
 - **Reasoning models** — preserves `reasoning_content` across turns (Kimi k2.6, DeepSeek-R1)
 - **Model catalog** — proxies `/v1/models` from the upstream provider
+- **Auto-config** — `--print-config` generates a complete Codex config with model metadata
 
 ## Configuration
 
