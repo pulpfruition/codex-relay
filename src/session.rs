@@ -53,7 +53,7 @@ impl SessionStore {
         if !reasoning.is_empty() {
             // Store under content-only key so lookups work even when Codex
             // replays the assistant text and function_calls as separate items.
-            let content = assistant.content.as_deref().unwrap_or("");
+            let content = assistant.text_content();
             if !content.is_empty() {
                 let key = Self::content_key(content);
                 self.turn_reasoning.insert(key, reasoning.clone());
@@ -73,7 +73,7 @@ impl SessionStore {
 
     /// Look up reasoning_content for an assistant turn by its text content.
     pub fn get_turn_reasoning(&self, _prior: &[ChatMessage], assistant: &ChatMessage) -> Option<String> {
-        let content = assistant.content.as_deref().unwrap_or("");
+        let content = assistant.text_content();
         if content.is_empty() {
             return None;
         }
@@ -123,7 +123,7 @@ mod tests {
     fn msg(role: &str, content: Option<&str>) -> ChatMessage {
         ChatMessage {
             role: role.into(),
-            content: content.map(Into::into),
+            content: content.map(|s| serde_json::Value::String(s.into())),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -190,7 +190,7 @@ mod tests {
         let id = store.save(msgs.clone());
         let got = store.get_history(&id);
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0].content.as_deref(), Some("hi"));
+        assert_eq!(got[0].text_content(), "hi");
 
         // save_with_id
         let id2 = store.new_id();

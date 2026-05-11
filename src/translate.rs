@@ -15,7 +15,7 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
                 0,
                 ChatMessage {
                     role: "system".into(),
-                    content: Some(system.clone()),
+                    content: Some(Value::String(system.clone())),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -30,7 +30,7 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
         ResponsesInput::Text(text) => {
             messages.push(ChatMessage {
                 role: "user".into(),
-                content: Some(text.clone()),
+                content: Some(Value::String(text.clone())),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -126,7 +126,7 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
                             let output  = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
                             messages.push(ChatMessage {
                                 role: "tool".into(),
-                                content: Some(output.to_string()),
+                                content: Some(Value::String(output.to_string())),
                                 reasoning_content: None,
                                 tool_calls: None,
                                 tool_call_id: Some(call_id.to_string()),
@@ -147,10 +147,9 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
                                 other => other,
                             }
                             .to_string();
-                            let content = value_to_text(item.get("content"));
                             let mut msg = ChatMessage {
                                 role,
-                                content: Some(content),
+                                content: value_to_chat_content(item.get("content")),
                                 reasoning_content: None,
                                 tool_calls: None,
                                 tool_call_id: None,
@@ -243,7 +242,7 @@ pub fn from_chat_response(
     let choice = chat.choices.into_iter().next().unwrap_or_else(|| ChatChoice {
         message: ChatMessage {
             role: "assistant".into(),
-            content: Some(String::new()),
+            content: Some(Value::String(String::new())),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -251,7 +250,7 @@ pub fn from_chat_response(
         },
     });
 
-    let text = choice.message.content.clone().unwrap_or_default();
+    let text = choice.message.text_content().to_string();
     let usage = chat.usage.unwrap_or(ChatUsage {
         prompt_tokens: 0,
         completion_tokens: 0,
@@ -280,17 +279,74 @@ pub fn from_chat_response(
     (response, vec![choice.message])
 }
 
-/// Collapse a Responses API content value (string or parts array) to plain text.
-fn value_to_text(v: Option<&Value>) -> String {
+/// Translate a Responses-API `content` value to its Chat Completions equivalent.
+///
+/// - Plain string → `Value::String`.
+/// - Parts array containing only text → collapsed to `Value::String` (the
+///   shape Chat Completions expects in the common text-only case, and the
+///   shape session.rs's reasoning fingerprint compares against).
+/// - Parts array with any non-text part (e.g. `input_image`) → kept as a
+///   `Value::Array` of multimodal Chat Completions parts:
+///     * `input_text` / `text`  → `{type:"text", text}`
+///     * `input_image` (string) → `{type:"image_url", image_url:{url}}`
+///     * `image_url`            → normalized to `{type:"image_url", image_url:{url}}`
+///   Unknown part types pass through; the upstream may reject them and the
+///   relay propagates that error as-is.
+fn value_to_chat_content(v: Option<&Value>) -> Option<Value> {
     match v {
-        None => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join(""),
-        Some(other) => other.to_string(),
+        None => None,
+        Some(Value::String(s)) => Some(Value::String(s.clone())),
+        Some(Value::Array(parts)) => {
+            // `output_text` is what Codex replays for assistant history items;
+            // treat it the same as text for the purposes of collapsing.
+            let has_non_text = parts.iter().any(|p| {
+                let kind = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                !matches!(kind, "input_text" | "text" | "output_text")
+            });
+            if !has_non_text {
+                let s: String = parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("");
+                Some(Value::String(s))
+            } else {
+                let mapped: Vec<Value> = parts.iter().map(map_content_part).collect();
+                Some(Value::Array(mapped))
+            }
+        }
+        Some(other) => Some(Value::String(other.to_string())),
+    }
+}
+
+/// Reshape a single Responses-API content part into a Chat Completions one.
+fn map_content_part(part: &Value) -> Value {
+    let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match kind {
+        "input_text" | "text" | "output_text" => {
+            let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            json!({"type": "text", "text": text})
+        }
+        "input_image" => {
+            // Responses API: image_url is a plain string (often a data: URL).
+            // Chat Completions wants it wrapped in an object.
+            let url = part
+                .get("image_url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            json!({"type": "image_url", "image_url": {"url": url}})
+        }
+        "image_url" => {
+            // Either already-Chat-Completions-shaped (image_url is an object)
+            // or a Responses-style flat url; normalize both.
+            let inner = match part.get("image_url") {
+                Some(Value::Object(_)) => part.get("image_url").cloned().unwrap_or(Value::Null),
+                Some(Value::String(s)) => json!({"url": s}),
+                _ => json!({"url": ""}),
+            };
+            json!({"type": "image_url", "image_url": inner})
+        }
+        _ => part.clone(),
     }
 }
 
@@ -320,7 +376,7 @@ mod tests {
         let chat = to_chat_request(&req, vec![], &sessions);
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, "user");
-        assert_eq!(chat.messages[0].content.as_deref(), Some("hello"));
+        assert_eq!(chat.messages[0].text_content(), "hello");
     }
 
     #[test]
@@ -330,7 +386,7 @@ mod tests {
         req.instructions = Some("be helpful".into());
         let chat = to_chat_request(&req, vec![], &sessions);
         assert_eq!(chat.messages[0].role, "system");
-        assert_eq!(chat.messages[0].content.as_deref(), Some("be helpful"));
+        assert_eq!(chat.messages[0].text_content(), "be helpful");
     }
 
     #[test]
@@ -341,7 +397,7 @@ mod tests {
         ]));
         let chat = to_chat_request(&req, vec![], &sessions);
         assert_eq!(chat.messages[0].role, "system");
-        assert_eq!(chat.messages[0].content.as_deref(), Some("secret instructions"));
+        assert_eq!(chat.messages[0].text_content(), "secret instructions");
     }
 
     #[test]
@@ -368,7 +424,7 @@ mod tests {
         ]));
         let chat = to_chat_request(&req, vec![], &sessions);
         assert_eq!(chat.messages[0].role, "tool");
-        assert_eq!(chat.messages[0].content.as_deref(), Some("result"));
+        assert_eq!(chat.messages[0].text_content(), "result");
         assert_eq!(chat.messages[0].tool_call_id.as_deref(), Some("c1"));
     }
 
@@ -403,7 +459,65 @@ mod tests {
             json!({"type": "message", "role": "user", "content": "plain text"}),
         ]));
         let chat = to_chat_request(&req, vec![], &sessions);
-        assert_eq!(chat.messages[0].content.as_deref(), Some("plain text"));
+        assert_eq!(chat.messages[0].text_content(), "plain text");
+    }
+
+    /// input_image (Responses API) + input_text → Chat Completions
+    /// multimodal content array with image_url wrapped in {url:...}.
+    #[test]
+    fn test_input_image_becomes_multimodal_content() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "what is this?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
+            ]}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        let parts = chat.messages[0]
+            .content
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .expect("content must be a parts array when an image is present");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAA");
+    }
+
+    /// Chat-Completions-style image_url passes through normalized.
+    #[test]
+    fn test_chat_style_image_url_passes_through() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+            ]}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        let parts = chat.messages[0]
+            .content
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .expect("multimodal content");
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[0]["image_url"]["url"], "https://example.com/x.png");
+    }
+
+    /// Text-only content arrays must still collapse to a plain string —
+    /// session.rs fingerprints assistant turns on the string form.
+    #[test]
+    fn test_text_only_parts_collapse_to_string() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.messages[0].content.as_ref().unwrap().is_string());
+        assert_eq!(chat.messages[0].text_content(), "hi");
     }
 
     #[test]
@@ -416,7 +530,7 @@ mod tests {
             ]}),
         ]));
         let chat = to_chat_request(&req, vec![], &sessions);
-        assert_eq!(chat.messages[0].content.as_deref(), Some("hello world"));
+        assert_eq!(chat.messages[0].text_content(), "hello world");
     }
 
     // ── Deduplication tests ────────────────────────────────────────────

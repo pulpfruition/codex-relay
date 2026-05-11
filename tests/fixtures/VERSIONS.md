@@ -34,6 +34,26 @@ Live tests gated by `DEEPSEEK_API_KEY` env var. Run with:
 DEEPSEEK_API_KEY=sk-... cargo test --test compat_deepseek_live -- --ignored
 ```
 
+Note: as of 2026-05-11 DeepSeek's Chat Completions endpoint does **not**
+accept multimodal image content parts — it rejects `image_url`, `input_image`,
+and `image` with `"unknown variant ..., expected text"`. Image-input wire
+shape is verified via a recording proxy (DeepSeek's 200/400 is ignored;
+only the relay's outbound body is asserted).
+
+## Kimi / Moonshot (live tests)
+
+| Model | Wire shape | Notes |
+|---|---|---|
+| `kimi-k2.6` | Chat Completions | Accepts standard OpenAI multimodal content (verified 2026-05-11) |
+| `moonshot-v1-32k-vision-preview` | Chat Completions | Dedicated vision preview, backup pin |
+
+Used as our happy-path image-input verification since DeepSeek doesn't yet
+support vision on its Chat Completions endpoint. Gated by `MOONSHOT_API_KEY`:
+
+```
+MOONSHOT_API_KEY=sk-... cargo test --test compat_kimi_live -- --ignored
+```
+
 Tests are `#[ignore]` so the default `cargo test` stays fully offline.
 
 ## codex-relay

@@ -712,3 +712,131 @@ async fn live_deepseek_v4_pro_reasoning_round_trip() {
         .map(|s| s.contains("Beijing"))
         .unwrap_or(false));
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 6: multimodal image-input wire shape, verified live.
+//
+// Empirically confirmed 2026-05-11: DeepSeek's Chat Completions API does NOT
+// accept any multimodal content part variant — it returns
+//   400 invalid_request_error: "unknown variant `image_url`, expected `text`"
+// for `image_url`, `input_image`, and `image` alike. So we can't do an
+// end-to-end happy-path image test against DeepSeek today.
+//
+// What we *can* lock in live, however, is that codex-relay's outbound Chat
+// Completions body has the right OpenAI-standard multimodal shape, so the
+// moment DeepSeek (or any other provider in the supported list) enables
+// vision, codex-relay users get it for free without further changes.
+//
+// We use a recording proxy in front of DeepSeek that captures the outbound
+// body BEFORE forwarding. The relay's translation is asserted on the
+// captured body; the upstream's eventual 400 is expected and ignored.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// 1×1 red PNG, base64-encoded. Tiny but valid; enough to exercise the
+/// vision input path without bloating fixtures.
+const TINY_RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+fn image_input_body(model: &str) -> Value {
+    let data_url = format!("data:image/png;base64,{TINY_RED_PNG_B64}");
+    json!({
+        "model": model,
+        "instructions": "Answer in one short sentence.",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Describe the attached image briefly."},
+                {"type": "input_image", "image_url": data_url}
+            ]
+        }],
+        "tools": [],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "store": false,
+        "stream": false,
+        "include": []
+    })
+}
+
+/// Recording-proxy live test: send a Codex-shaped `input_image` request,
+/// inspect what the relay forwarded upstream, assert it's multimodal-shaped.
+/// We don't require the upstream to return 2xx — DeepSeek currently 400s on
+/// any image, and that's a property of *their* API, not the relay's.
+#[tokio::test]
+#[ignore]
+async fn live_deepseek_v4_pro_image_input_wire_shape() {
+    let Some(key) = need_key() else { return };
+
+    let (proxy_port, recorded_bodies) =
+        spawn_recording_proxy("https://api.deepseek.com", &key).await;
+    let proxy_upstream = format!("http://127.0.0.1:{proxy_port}/v1");
+    let relay = Relay::spawn(&proxy_upstream, &key);
+
+    // Fire and forget — don't unwrap the status. The relay forwards whatever
+    // DeepSeek returns (200 if/when they support vision, 400 today). Either
+    // way the recording proxy has already captured what we sent.
+    let _ = reqwest::Client::new()
+        .post(relay.url("/v1/responses"))
+        .json(&image_input_body("deepseek-v4-pro"))
+        .send()
+        .await
+        .expect("POST");
+
+    let bodies = recorded_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "expected exactly 1 chat-completions POST");
+    let body: Value = serde_json::from_slice(&bodies[0]).expect("body json");
+    let user = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["role"].as_str() == Some("user"))
+        .expect("user message");
+
+    let parts = user["content"]
+        .as_array()
+        .expect("user content must be a multimodal array (got non-array)");
+    let has_text = parts
+        .iter()
+        .any(|p| p["type"].as_str() == Some("text") && p["text"].as_str().is_some());
+    let has_image = parts.iter().any(|p| {
+        p["type"].as_str() == Some("image_url")
+            && p["image_url"]["url"]
+                .as_str()
+                .map(|s| s.starts_with("data:image/png;base64,"))
+                .unwrap_or(false)
+    });
+    assert!(has_text, "missing text part: {parts:?}");
+    assert!(has_image, "missing image_url part: {parts:?}");
+    eprintln!("✓ outbound multimodal shape verified ({} parts)", parts.len());
+}
+
+/// Companion to the wire-shape test: confirm the symptom of DeepSeek's
+/// current vision-input rejection so we can spot the day they enable it.
+/// When this test starts FAILING (i.e. DeepSeek stops 400'ing on image_url),
+/// flip it into a proper happy-path test.
+#[tokio::test]
+#[ignore]
+async fn live_deepseek_v4_pro_image_input_currently_rejected_by_upstream() {
+    let Some(key) = need_key() else { return };
+    let relay = Relay::spawn(DEEPSEEK_UPSTREAM, &key);
+
+    let resp = reqwest::Client::new()
+        .post(relay.url("/v1/responses"))
+        .json(&image_input_body("deepseek-v4-pro"))
+        .send()
+        .await
+        .expect("POST");
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    // As of 2026-05-11 DeepSeek's Chat Completions deserializer rejects every
+    // image content-part variant with this exact message. If that ever stops
+    // being true, this assertion fires and we know vision support landed.
+    assert!(
+        status == reqwest::StatusCode::BAD_REQUEST
+            && body.contains("unknown variant")
+            && body.contains("image_url"),
+        "DeepSeek may have enabled vision input — status={status}, body={body}"
+    );
+}

@@ -81,9 +81,45 @@ fn reasoning_input_items_are_dropped() {
     let texts: Vec<&str> = chat
         .messages
         .iter()
-        .map(|m| m.content.as_deref().unwrap_or(""))
+        .map(|m| m.text_content())
         .collect();
     assert_eq!(texts, ["system", "first turn", "second turn"]);
+}
+
+/// Codex 0.128 sends image attachments as `input_image` content parts with a
+/// flat `image_url` string. The relay must translate these into the Chat
+/// Completions multimodal shape (content as an array containing `image_url`
+/// parts wrapped in `{url}`) so vision-capable upstreams (e.g. DeepSeek V4
+/// Pro) can receive them. Locks in the wire-shape contract verified live in
+/// `compat_deepseek_live.rs::live_deepseek_v4_pro_image_input_wire_shape`.
+#[test]
+fn input_image_becomes_chat_completions_multimodal() {
+    let req = fixture("with_image_input.json");
+    let chat = to_chat_request(&req, Vec::new(), &SessionStore::new());
+
+    // messages[0] = system (from `instructions`), messages[1] = user with image.
+    assert_eq!(chat.messages.len(), 2);
+    assert_eq!(chat.messages[0].role, "system");
+    assert_eq!(chat.messages[1].role, "user");
+
+    let parts = chat.messages[1]
+        .content
+        .as_ref()
+        .and_then(Value::as_array)
+        .expect("user content must be a multimodal array");
+    assert_eq!(parts.len(), 2, "parts: {parts:?}");
+
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(parts[0]["text"], "What is in this image?");
+
+    assert_eq!(parts[1]["type"], "image_url");
+    let url = parts[1]["image_url"]["url"]
+        .as_str()
+        .expect("image_url.url must be a string (Chat Completions shape)");
+    assert!(
+        url.starts_with("data:image/png;base64,"),
+        "url not a data URL: {url}"
+    );
 }
 
 #[test]

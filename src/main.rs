@@ -5,7 +5,7 @@ mod types;
 
 use anyhow::{bail, Result};
 use axum::{
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -91,10 +91,15 @@ async fn main() -> Result<()> {
         api_key,
     ));
 
+    // Disable axum's default 2 MiB body cap: Codex CLI may send base64-encoded
+    // image attachments that easily exceed it, and a framework-level 413 looks
+    // like a transport-layer death to Codex and crashes the session (#2).
+    // The relay only binds 127.0.0.1, so DoS isn't a concern here.
     let app = Router::new()
         .route("/v1/responses", post(handle_responses))
         .route("/v1/models", get(handle_models))
         .fallback(handle_fallback)
+        .layer(DefaultBodyLimit::disable())
         .with_state(state.clone());
 
     let addr = format!("127.0.0.1:{}", args.port);
@@ -385,6 +390,7 @@ async fn handle_responses(
         req.tools.len(),
         req.previous_response_id
     );
+
     handle_responses_inner(state, req).await
 }
 
@@ -462,7 +468,7 @@ async fn handle_blocking(
                     .map(|c| c.message.clone())
                     .unwrap_or_else(|| ChatMessage {
                         role: "assistant".into(),
-                        content: Some(String::new()),
+                        content: Some(serde_json::Value::String(String::new())),
                         reasoning_content: None,
                         tool_calls: None,
                         tool_call_id: None,
@@ -554,4 +560,5 @@ mod tests {
         assert!(!props.supports_reasoning_summaries);
         assert!(props.supports_parallel_tool_calls);
     }
+
 }

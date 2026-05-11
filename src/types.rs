@@ -83,7 +83,11 @@ pub struct ChatRequest {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: Option<String>,
+    /// Either a plain string (the common case) or a multimodal content-parts
+    /// array (`[{type:"text",...}, {type:"image_url",...}]`). Modeled as a raw
+    /// JSON Value so both shapes pass through serde transparently. Use
+    /// [`ChatMessage::text_content`] when you only care about the text.
+    pub content: Option<Value>,
     /// Reasoning/thinking content emitted by models like kimi-k2.6.
     /// Must be round-tripped back when replaying tool call history.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,6 +98,18 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+impl ChatMessage {
+    /// Best-effort plain-text view of `content`. Returns `""` for missing,
+    /// non-string, or multimodal payloads — callers that care about the
+    /// multimodal parts should look at `content` directly.
+    pub fn text_content(&self) -> &str {
+        self.content
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    }
 }
 
 #[derive(Debug, Deserialize)]

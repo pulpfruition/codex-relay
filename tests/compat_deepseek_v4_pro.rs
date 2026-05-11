@@ -71,7 +71,7 @@ fn test_deepseek_v4_pro_reasoning_roundtrip_text_only() {
     // messages[2] = user "Continue"
     assert_eq!(chat.messages.len(), 3);
     assert_eq!(chat.messages[1].role, "assistant");
-    assert_eq!(chat.messages[1].content.as_deref(), Some("Let me analyze this"));
+    assert_eq!(chat.messages[1].text_content(), "Let me analyze this");
     assert_eq!(
         chat.messages[1].reasoning_content.as_deref(),
         Some("<think>analyzing the problem...</think>"),
@@ -122,7 +122,7 @@ fn test_deepseek_v4_pro_reasoning_roundtrip_with_tool_calls() {
 
     // Assistant TEXT message should have reasoning_content
     assert_eq!(chat.messages[1].role, "assistant");
-    assert_eq!(chat.messages[1].content.as_deref(), Some("Let me check"));
+    assert_eq!(chat.messages[1].text_content(), "Let me check");
     assert_eq!(
         chat.messages[1].reasoning_content.as_deref(),
         Some("<think>need to read files</think>"),
@@ -168,7 +168,7 @@ fn test_deepseek_v4_pro_multi_turn_reasoning() {
 
     // Turn 1 assistant
     assert_eq!(chat.messages[1].role, "assistant");
-    assert_eq!(chat.messages[1].content.as_deref(), Some("Step 1 analysis"));
+    assert_eq!(chat.messages[1].text_content(), "Step 1 analysis");
     assert_eq!(
         chat.messages[1].reasoning_content.as_deref(),
         Some("<think>first pass thinking</think>"),
@@ -177,7 +177,7 @@ fn test_deepseek_v4_pro_multi_turn_reasoning() {
 
     // Turn 2 assistant
     assert_eq!(chat.messages[3].role, "assistant");
-    assert_eq!(chat.messages[3].content.as_deref(), Some("Step 2 deeper look"));
+    assert_eq!(chat.messages[3].text_content(), "Step 2 deeper look");
     assert_eq!(
         chat.messages[3].reasoning_content.as_deref(),
         Some("<think>second pass thinking</think>"),
@@ -203,7 +203,7 @@ fn test_non_thinking_model_no_reasoning_content() {
 
     assert_eq!(chat.messages.len(), 3);
     assert_eq!(chat.messages[1].role, "assistant");
-    assert_eq!(chat.messages[1].content.as_deref(), Some("Hi there!"));
+    assert_eq!(chat.messages[1].text_content(), "Hi there!");
     assert!(
         chat.messages[1].reasoning_content.is_none(),
         "non-thinking model should have reasoning_content=None"
