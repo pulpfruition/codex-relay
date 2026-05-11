@@ -3,6 +3,39 @@ use std::collections::HashSet;
 
 use crate::{session::SessionStore, types::*};
 
+/// Content parts that the relay can't currently forward to Chat Completions.
+/// Reported up to the handler so it can return a clean 4xx instead of either
+/// silently dropping the part or letting axum's body limit kill the session
+/// (see issue #2: image attachments → 413 → unrecoverable Codex crash).
+pub struct UnsupportedContent {
+    pub kind: String,
+}
+
+/// Returns the first multimodal content part the relay does not yet translate.
+/// Today: anything tagged `input_image` or `image_url` in a message item's
+/// content array. Multimodal forwarding is a separate feature; this check
+/// exists so the handler can fail fast with an actionable error.
+pub fn first_unsupported_content(req: &ResponsesRequest) -> Option<UnsupportedContent> {
+    let items = match &req.input {
+        ResponsesInput::Messages(v) => v,
+        ResponsesInput::Text(_) => return None,
+    };
+    for item in items {
+        let Some(parts) = item.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for part in parts {
+            let kind = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if kind == "input_image" || kind == "image_url" {
+                return Some(UnsupportedContent {
+                    kind: kind.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Convert a Responses API request + prior history into a Chat Completions request.
 pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessions: &SessionStore) -> ChatRequest {
     let mut messages = history;
@@ -404,6 +437,44 @@ mod tests {
         ]));
         let chat = to_chat_request(&req, vec![], &sessions);
         assert_eq!(chat.messages[0].content.as_deref(), Some("plain text"));
+    }
+
+    #[test]
+    fn test_first_unsupported_content_flags_input_image() {
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "what is this?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
+            ]}),
+        ]));
+        let hit = first_unsupported_content(&req).expect("should detect image");
+        assert_eq!(hit.kind, "input_image");
+    }
+
+    #[test]
+    fn test_first_unsupported_content_flags_chat_style_image_url() {
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+            ]}),
+        ]));
+        assert!(first_unsupported_content(&req).is_some());
+    }
+
+    #[test]
+    fn test_first_unsupported_content_text_only_is_none() {
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}),
+        ]));
+        assert!(first_unsupported_content(&req).is_none());
+    }
+
+    #[test]
+    fn test_first_unsupported_content_plain_text_input_is_none() {
+        let req = base_req(ResponsesInput::Text("hi".into()));
+        assert!(first_unsupported_content(&req).is_none());
     }
 
     #[test]
