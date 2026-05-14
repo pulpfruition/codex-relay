@@ -669,4 +669,86 @@ mod tests {
         assert_eq!(chat.messages[2].role, "tool");
         assert_eq!(chat.messages[3].role, "user");
     }
+
+    // ── System/developer interleaving tests (#4) ──────────────────────
+
+    /// When Codex interleaves a developer/system message between
+    /// function_call and function_call_output items, it must be moved to
+    /// the front so the Chat Completions API sees:
+    ///   assistant[tool_calls] → tool  (not assistant[tool_calls] → system → tool)
+    #[test]
+    fn test_system_message_between_tool_calls_moved_to_front() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "exec", "arguments": "{}"}),
+            json!({"type": "message", "role": "developer", "content": "be careful"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "done"}),
+            json!({"type": "message", "role": "user", "content": "next turn"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        let roles: Vec<&str> = chat.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "assistant", "tool", "user"],
+            "system must be at front, assistant→tool pairing must be contiguous");
+    }
+
+    /// When a system/developer message appears at the very start of input
+    /// items (before any function calls), it still lands at messages[0].
+    #[test]
+    fn test_system_message_at_start_of_input() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "developer", "content": "rules"}),
+            json!({"type": "message", "role": "user", "content": "hello"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages[0].role, "system");
+        assert_eq!(chat.messages[0].text_content(), "rules");
+        assert_eq!(chat.messages[1].role, "user");
+    }
+
+    /// When both `instructions` and a developer input item provide a system
+    /// prompt, the later one (from input items) wins.
+    #[test]
+    fn test_system_from_input_replaces_instructions() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": "hi"}),
+            json!({"type": "message", "role": "developer", "content": "override"}),
+        ]));
+        req.instructions = Some("original".into());
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages[0].role, "system");
+        assert_eq!(chat.messages[0].text_content(), "override");
+    }
+
+    // ── Model name mapping tests (#4) ─────────────────────────────────
+
+    #[test]
+    fn test_map_model_name_with_env() {
+        std::env::set_var("CODEX_RELAY_MODEL_MAP", "gpt-5.4:deepseek-v4-pro,gpt-5.5:deepseek-v4-pro");
+        assert_eq!(map_model_name("gpt-5.4"), "deepseek-v4-pro");
+        assert_eq!(map_model_name("gpt-5.5"), "deepseek-v4-pro");
+        std::env::remove_var("CODEX_RELAY_MODEL_MAP");
+    }
+
+    #[test]
+    fn test_map_model_name_no_match_passthrough() {
+        std::env::set_var("CODEX_RELAY_MODEL_MAP", "gpt-5.4:deepseek-v4-pro");
+        assert_eq!(map_model_name("unknown-model"), "unknown-model");
+        std::env::remove_var("CODEX_RELAY_MODEL_MAP");
+    }
+
+    #[test]
+    fn test_map_model_name_no_env_var() {
+        std::env::remove_var("CODEX_RELAY_MODEL_MAP");
+        assert_eq!(map_model_name("gpt-5.4"), "gpt-5.4");
+    }
+
+    #[test]
+    fn test_map_model_name_trims_whitespace() {
+        std::env::set_var("CODEX_RELAY_MODEL_MAP", " gpt-5.4 : deepseek-v4-pro , gpt-5.5 : deepseek-v4-flash ");
+        assert_eq!(map_model_name("gpt-5.4"), "deepseek-v4-pro");
+        assert_eq!(map_model_name("gpt-5.5"), "deepseek-v4-flash");
+        std::env::remove_var("CODEX_RELAY_MODEL_MAP");
+    }
 }

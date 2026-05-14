@@ -81,6 +81,7 @@ input_modalities = ["text"]
 | `--port` | `CODEX_RELAY_PORT` | `4444` | Listen port |
 | `--upstream` | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `--api-key` | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
+| `--model-map` | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations |
 | `--print-config` | _(none)_ | — | Print a Codex config snippet with `model_properties` and exit |
 
 ## Supported providers
@@ -113,6 +114,7 @@ Any OpenAI-compatible endpoint works.
 | `CODEX_RELAY_PORT` | `4444` | Port to listen on |
 | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
+| `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations (e.g., `gpt-5.4:deepseek-v4-pro`) |
 | `RUST_LOG` | `codex_relay=info` | Log verbosity |
 
 ## Python API
@@ -167,6 +169,10 @@ working with the previous Codex CLI release.
 ## Disclaimer
 
 This project is **not affiliated with, endorsed by, or sponsored by OpenAI**. "Codex" refers to [OpenAI Codex CLI](https://github.com/openai/codex), an open-source project licensed under Apache-2.0. codex-relay is an independent, community-built translation proxy.
+
+## Contributors
+
+- [myk5010](https://github.com/myk5010) — system/developer message ordering fix and model name mapping ([\#4](https://github.com/MetaFARS/codex-relay/pull/4))
 
 ## License
 
