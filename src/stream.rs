@@ -12,7 +12,8 @@ use tracing::{error, warn};
 
 use crate::{
     session::SessionStore,
-    types::{ChatMessage, ChatRequest, ChatStreamChunk},
+    translate::split_mcp_function_name,
+    types::{ChatMessage, ChatRequest, ChatStreamChunk, ChatUsage},
 };
 
 pub struct StreamArgs {
@@ -97,6 +98,7 @@ pub fn translate_stream(
         let mut tool_calls: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
         let mut emitted_message_item = false;
         let mut stream_done = false;
+        let mut stream_usage: Option<ChatUsage> = None;
         let mut source = upstream.bytes_stream().eventsource();
 
         while let Some(ev) = source.next().await {
@@ -114,7 +116,11 @@ pub fn translate_stream(
                     match serde_json::from_str::<ChatStreamChunk>(&ev.data) {
                         Err(e) => warn!("chunk parse error: {e} — data: {}", ev.data),
                         Ok(chunk) => {
-                            for choice in &chunk.choices {
+                            let ChatStreamChunk { choices, usage } = chunk;
+                            if usage.is_some() {
+                                stream_usage = usage;
+                            }
+                            for choice in &choices {
                                 // Reasoning/thinking content (kimi-k2.6 etc.)
                                 if let Some(rc) = choice.delta.reasoning_content.as_deref() {
                                     if !rc.is_empty() {
@@ -207,20 +213,34 @@ pub fn translate_stream(
         for (rel_idx, (_, tc)) in tool_calls.iter().enumerate() {
             let fc_item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
             let output_index = base_index + rel_idx;
+            let (namespace, name) = split_mcp_function_name(&tc.name);
+            let mut added_item = json!({
+                "type": "function_call",
+                "id": &fc_item_id,
+                "call_id": &tc.id,
+                "name": &name,
+                "arguments": "",
+                "status": "in_progress"
+            });
+            let mut done_item = json!({
+                "type": "function_call",
+                "id": &fc_item_id,
+                "call_id": &tc.id,
+                "name": &name,
+                "arguments": &tc.arguments,
+                "status": "completed"
+            });
+            if let Some(namespace) = namespace {
+                added_item["namespace"] = Value::String(namespace.clone());
+                done_item["namespace"] = Value::String(namespace);
+            }
 
             yield Ok(Event::default()
                 .event("response.output_item.added")
                 .data(json!({
                     "type": "response.output_item.added",
                     "output_index": output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": &fc_item_id,
-                        "call_id": &tc.id,
-                        "name": &tc.name,
-                        "arguments": "",
-                        "status": "in_progress"
-                    }
+                    "item": added_item
                 }).to_string()));
 
             if !tc.arguments.is_empty() {
@@ -239,24 +259,10 @@ pub fn translate_stream(
                 .data(json!({
                     "type": "response.output_item.done",
                     "output_index": output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": &fc_item_id,
-                        "call_id": &tc.id,
-                        "name": &tc.name,
-                        "arguments": &tc.arguments,
-                        "status": "completed"
-                    }
+                    "item": done_item
                 }).to_string()));
 
-            fc_items.push(json!({
-                "type": "function_call",
-                "id": fc_item_id,
-                "call_id": &tc.id,
-                "name": &tc.name,
-                "arguments": &tc.arguments,
-                "status": "completed"
-            }));
+            fc_items.push(done_item);
         }
 
         if stream_done {
@@ -311,6 +317,7 @@ pub fn translate_stream(
                 }));
             }
             output_items.extend(fc_items);
+            let usage = stream_usage.unwrap_or_default();
 
             yield Ok(Event::default()
                 .event("response.completed")
@@ -320,7 +327,12 @@ pub fn translate_stream(
                         "id": &response_id,
                         "status": "completed",
                         "model": &model,
-                        "output": output_items
+                        "output": output_items,
+                        "usage": {
+                            "input_tokens": usage.prompt_tokens,
+                            "output_tokens": usage.completion_tokens,
+                            "total_tokens": usage.total_tokens
+                        }
                     }
                 }).to_string()));
         } else {

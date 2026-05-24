@@ -46,16 +46,8 @@ pub struct ResponsesResponse {
     pub id: String,
     pub object: &'static str,
     pub model: String,
-    pub output: Vec<ResponsesOutputItem>,
+    pub output: Vec<Value>,
     pub usage: ResponsesUsage,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ResponsesOutputItem {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub role: String,
-    pub content: Vec<ContentPart>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -77,7 +69,14 @@ pub struct ChatRequest {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<ChatStreamOptions>,
     pub stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatStreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -105,10 +104,7 @@ impl ChatMessage {
     /// non-string, or multimodal payloads — callers that care about the
     /// multimodal parts should look at `content` directly.
     pub fn text_content(&self) -> &str {
-        self.content
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
+        self.content.as_ref().and_then(|v| v.as_str()).unwrap_or("")
     }
 }
 
@@ -124,7 +120,7 @@ pub struct ChatChoice {
     pub message: ChatMessage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ChatUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -137,7 +133,6 @@ pub struct ChatUsage {
 pub struct ChatStreamChunk {
     pub choices: Vec<ChatStreamChoice>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub usage: Option<ChatUsage>,
 }
 

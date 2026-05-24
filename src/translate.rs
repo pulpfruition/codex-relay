@@ -4,7 +4,11 @@ use std::collections::HashSet;
 use crate::{session::SessionStore, types::*};
 
 /// Convert a Responses API request + prior history into a Chat Completions request.
-pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessions: &SessionStore) -> ChatRequest {
+pub fn to_chat_request(
+    req: &ResponsesRequest,
+    history: Vec<ChatMessage>,
+    sessions: &SessionStore,
+) -> ChatRequest {
     let mut messages = history;
 
     // Prefer `instructions` (Codex CLI) over `system` (other clients).
@@ -41,12 +45,14 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
             // Collect call_ids already present in history (from previous_response_id).
             // This prevents creating duplicate assistant-with-tool_calls messages
             // when the input items replay function_call entries from prior output.
-            let existing_call_ids: HashSet<String> = messages.iter()
+            let existing_call_ids: HashSet<String> = messages
+                .iter()
                 .flat_map(|msg| {
                     let mut ids: Vec<String> = Vec::new();
                     if let Some(tcs) = &msg.tool_calls {
-                        ids.extend(tcs.iter()
-                            .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(String::from)));
+                        ids.extend(tcs.iter().filter_map(|tc| {
+                            tc.get("id").and_then(|v| v.as_str()).map(String::from)
+                        }));
                     }
                     ids.extend(msg.tool_call_id.iter().cloned());
                     ids
@@ -55,7 +61,8 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
 
             // For function_call_output dedup, only skip if a tool response
             // already exists for the call_id (not just from assistant tool_calls).
-            let existing_tool_responses: HashSet<String> = messages.iter()
+            let existing_tool_responses: HashSet<String> = messages
+                .iter()
                 .filter_map(|msg| msg.tool_call_id.clone())
                 .collect();
 
@@ -83,12 +90,16 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
 
                     while i < items.len() {
                         let cur = &items[i];
-                        if cur.get("type").and_then(|v| v.as_str()).unwrap_or("") != "function_call" {
+                        if cur.get("type").and_then(|v| v.as_str()).unwrap_or("") != "function_call"
+                        {
                             break;
                         }
                         let call_id = cur.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                        let name    = cur.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let args    = cur.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                        let name = response_function_name_for_chat(cur);
+                        let args = cur
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
                         if reasoning_content.is_none() {
                             reasoning_content = sessions.get_reasoning(call_id);
                         }
@@ -116,14 +127,15 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
                 } else {
                     match item_type {
                         "function_call_output" => {
-                            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                            let call_id =
+                                item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                             // Skip function_call_output items if a tool response
                             // for this call_id already exists in history.
                             if existing_tool_responses.contains(call_id) {
                                 i += 1;
                                 continue;
                             }
-                            let output  = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                            let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Some(Value::String(output.to_string())),
@@ -159,7 +171,8 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
                             // from the turn-level index (needed for thinking models like
                             // DeepSeek that require reasoning_content to be passed back).
                             if msg.role == "assistant" {
-                                msg.reasoning_content = sessions.get_turn_reasoning(&messages, &msg);
+                                msg.reasoning_content =
+                                    sessions.get_turn_reasoning(&messages, &msg);
                             }
                             // System/developer messages from input items must go to the
                             // front of the array. Codex sometimes interleaves them between
@@ -189,6 +202,9 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
         tools: convert_tools(&req.tools),
         temperature: req.temperature,
         max_tokens: req.max_output_tokens,
+        stream_options: req.stream.then_some(ChatStreamOptions {
+            include_usage: true,
+        }),
         stream: req.stream,
     }
 }
@@ -222,10 +238,15 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
         match tool.get("type").and_then(Value::as_str) {
             Some("function") => out.push(convert_tool(tool)),
             Some("namespace") => {
+                let namespace = tool.get("name").and_then(Value::as_str).unwrap_or("");
                 if let Some(subs) = tool.get("tools").and_then(Value::as_array) {
                     for sub in subs {
                         if sub.get("type").and_then(Value::as_str) == Some("function") {
-                            out.push(convert_tool(sub));
+                            let name = sub
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(|name| format!("{namespace}{name}"));
+                            out.push(convert_tool_with_name(sub, name.as_deref()));
                         }
                     }
                 }
@@ -244,23 +265,49 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
 /// Chat Completions (nested):
 ///   {"type":"function","function":{"name":"foo","description":"...","parameters":{...}}}
 fn convert_tool(tool: &Value) -> Value {
+    convert_tool_with_name(tool, None)
+}
+
+fn convert_tool_with_name(tool: &Value, override_name: Option<&str>) -> Value {
     let Some(obj) = tool.as_object() else {
         return tool.clone();
     };
     // Already in Chat Completions format if it has a "function" sub-object.
     if obj.contains_key("function") {
-        return tool.clone();
+        let mut tool = tool.clone();
+        if let Some(name) = override_name {
+            if let Some(func) = tool.get_mut("function").and_then(Value::as_object_mut) {
+                func.insert("name".into(), Value::String(name.to_string()));
+            }
+        }
+        return tool;
     }
     // Convert from Responses API flat format.
     if obj.get("type").and_then(Value::as_str) == Some("function") {
         let mut func = serde_json::Map::new();
-        if let Some(v) = obj.get("name") { func.insert("name".into(), v.clone()); }
-        if let Some(v) = obj.get("description") { func.insert("description".into(), v.clone()); }
-        if let Some(v) = obj.get("parameters") { func.insert("parameters".into(), v.clone()); }
-        if let Some(v) = obj.get("strict") { func.insert("strict".into(), v.clone()); }
+        if let Some(name) = override_name {
+            func.insert("name".into(), Value::String(name.to_string()));
+        } else if let Some(v) = obj.get("name") {
+            func.insert("name".into(), v.clone());
+        }
+        if let Some(v) = obj.get("description") {
+            func.insert("description".into(), v.clone());
+        }
+        if let Some(v) = obj.get("parameters") {
+            func.insert("parameters".into(), v.clone());
+        }
+        if let Some(v) = obj.get("strict") {
+            func.insert("strict".into(), v.clone());
+        }
         return json!({"type": "function", "function": func});
     }
     tool.clone()
+}
+
+fn response_function_name_for_chat(item: &Value) -> String {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+    let namespace = item.get("namespace").and_then(Value::as_str).unwrap_or("");
+    format!("{namespace}{name}")
 }
 
 /// Convert a Chat Completions response into a Responses API response.
@@ -269,36 +316,68 @@ pub fn from_chat_response(
     model: &str,
     chat: ChatResponse,
 ) -> (ResponsesResponse, Vec<ChatMessage>) {
-    let choice = chat.choices.into_iter().next().unwrap_or_else(|| ChatChoice {
-        message: ChatMessage {
-            role: "assistant".into(),
-            content: Some(Value::String(String::new())),
-            reasoning_content: None,
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        },
-    });
+    let choice = chat
+        .choices
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| ChatChoice {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: Some(Value::String(String::new())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        });
+
+    let usage = chat.usage.unwrap_or_default();
+    let mut output = Vec::new();
 
     let text = choice.message.text_content().to_string();
-    let usage = chat.usage.unwrap_or(ChatUsage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-    });
+    if !text.is_empty() || choice.message.tool_calls.is_none() {
+        output.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": text,
+            }],
+        }));
+    }
+
+    if let Some(tool_calls) = &choice.message.tool_calls {
+        for tool_call in tool_calls {
+            let function = tool_call.get("function").unwrap_or(&Value::Null);
+            let raw_name = function.get("name").and_then(Value::as_str).unwrap_or("");
+            let (namespace, name) = split_mcp_function_name(raw_name);
+            let arguments = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            let mut item = json!({
+                "type": "function_call",
+                "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
+                "call_id": tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                "name": name,
+                "arguments": arguments,
+                "status": "completed"
+            });
+            if let Some(namespace) = namespace {
+                item["namespace"] = Value::String(namespace);
+            }
+            output.push(item);
+        }
+    }
 
     let response = ResponsesResponse {
         id,
         object: "response",
         model: model.to_string(),
-        output: vec![ResponsesOutputItem {
-            kind: "message".into(),
-            role: "assistant".into(),
-            content: vec![ContentPart {
-                kind: "output_text".into(),
-                text: Some(text),
-            }],
-        }],
+        output,
         usage: ResponsesUsage {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
@@ -307,6 +386,23 @@ pub fn from_chat_response(
     };
 
     (response, vec![choice.message])
+}
+
+pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
+    let Some(rest) = name.strip_prefix("mcp__") else {
+        return (None, name.to_string());
+    };
+    let Some(server_end) = rest.find("__") else {
+        return (None, name.to_string());
+    };
+    let split_at = "mcp__".len() + server_end + "__".len();
+    if split_at >= name.len() {
+        return (None, name.to_string());
+    }
+    (
+        Some(name[..split_at].to_string()),
+        name[split_at..].to_string(),
+    )
 }
 
 /// Translate a Responses-API `content` value to its Chat Completions equivalent.
@@ -360,10 +456,7 @@ fn map_content_part(part: &Value) -> Value {
         "input_image" => {
             // Responses API: image_url is a plain string (often a data: URL).
             // Chat Completions wants it wrapped in an object.
-            let url = part
-                .get("image_url")
-                .and_then(|u| u.as_str())
-                .unwrap_or("");
+            let url = part.get("image_url").and_then(|u| u.as_str()).unwrap_or("");
             json!({"type": "image_url", "image_url": {"url": url}})
         }
         "image_url" => {
@@ -384,6 +477,9 @@ fn map_content_part(part: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn base_req(input: ResponsesInput) -> ResponsesRequest {
         ResponsesRequest {
@@ -444,6 +540,55 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0]["id"], "c1");
         assert_eq!(calls[1]["id"], "c2");
+    }
+
+    #[test]
+    fn test_namespaced_function_call_replays_to_flattened_chat_name() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "function_call",
+            "call_id": "call_status",
+            "namespace": "mcp__burp_ai_agent__",
+            "name": "status",
+            "arguments": "{}"
+        })]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        let calls = chat.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(
+            calls[0]["function"]["name"].as_str(),
+            Some("mcp__burp_ai_agent__status")
+        );
+    }
+
+    #[test]
+    fn test_from_chat_response_splits_mcp_function_call_namespace() {
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_status",
+                        "type": "function",
+                        "function": {
+                            "name": "mcp__burp_ai_agent__status",
+                            "arguments": "{}"
+                        }
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+
+        let (resp, _) = from_chat_response("resp_1".into(), "test-model", chat);
+        assert_eq!(resp.output.len(), 1);
+        assert_eq!(resp.output[0]["type"], "function_call");
+        assert_eq!(resp.output[0]["namespace"], "mcp__burp_ai_agent__");
+        assert_eq!(resp.output[0]["name"], "status");
+        assert_eq!(resp.output[0]["call_id"], "call_status");
     }
 
     #[test]
@@ -607,7 +752,11 @@ mod tests {
 
         // Should have: user, assistant{tool_calls:[call_1]}, tool(call_1), user(next)
         // NOT: user, assistant{tool_calls:[call_1]}, assistant{tool_calls:[call_1]}, tool(call_1), user
-        assert_eq!(chat.messages.len(), 4, "should not duplicate assistant tool_calls message");
+        assert_eq!(
+            chat.messages.len(),
+            4,
+            "should not duplicate assistant tool_calls message"
+        );
         assert_eq!(chat.messages[0].role, "user");
         assert_eq!(chat.messages[1].role, "assistant");
         assert!(chat.messages[1].tool_calls.is_some());
@@ -687,8 +836,11 @@ mod tests {
         ]));
         let chat = to_chat_request(&req, vec![], &sessions);
         let roles: Vec<&str> = chat.messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, ["system", "assistant", "tool", "user"],
-            "system must be at front, assistant→tool pairing must be contiguous");
+        assert_eq!(
+            roles,
+            ["system", "assistant", "tool", "user"],
+            "system must be at front, assistant→tool pairing must be contiguous"
+        );
     }
 
     /// When a system/developer message appears at the very start of input
@@ -725,7 +877,11 @@ mod tests {
 
     #[test]
     fn test_map_model_name_with_env() {
-        std::env::set_var("CODEX_RELAY_MODEL_MAP", "gpt-5.4:deepseek-v4-pro,gpt-5.5:deepseek-v4-pro");
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(
+            "CODEX_RELAY_MODEL_MAP",
+            "gpt-5.4:deepseek-v4-pro,gpt-5.5:deepseek-v4-pro",
+        );
         assert_eq!(map_model_name("gpt-5.4"), "deepseek-v4-pro");
         assert_eq!(map_model_name("gpt-5.5"), "deepseek-v4-pro");
         std::env::remove_var("CODEX_RELAY_MODEL_MAP");
@@ -733,6 +889,7 @@ mod tests {
 
     #[test]
     fn test_map_model_name_no_match_passthrough() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("CODEX_RELAY_MODEL_MAP", "gpt-5.4:deepseek-v4-pro");
         assert_eq!(map_model_name("unknown-model"), "unknown-model");
         std::env::remove_var("CODEX_RELAY_MODEL_MAP");
@@ -740,13 +897,18 @@ mod tests {
 
     #[test]
     fn test_map_model_name_no_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("CODEX_RELAY_MODEL_MAP");
         assert_eq!(map_model_name("gpt-5.4"), "gpt-5.4");
     }
 
     #[test]
     fn test_map_model_name_trims_whitespace() {
-        std::env::set_var("CODEX_RELAY_MODEL_MAP", " gpt-5.4 : deepseek-v4-pro , gpt-5.5 : deepseek-v4-flash ");
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(
+            "CODEX_RELAY_MODEL_MAP",
+            " gpt-5.4 : deepseek-v4-pro , gpt-5.5 : deepseek-v4-flash ",
+        );
         assert_eq!(map_model_name("gpt-5.4"), "deepseek-v4-pro");
         assert_eq!(map_model_name("gpt-5.5"), "deepseek-v4-flash");
         std::env::remove_var("CODEX_RELAY_MODEL_MAP");
