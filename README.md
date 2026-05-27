@@ -83,6 +83,9 @@ input_modalities = ["text"]
 | `--api-key` | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
 | `--model-map` | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations |
 | `--print-config` | _(none)_ | — | Print a Codex config snippet with `model_properties` and exit |
+| `--session-ttl-hours` | `CODEX_RELAY_SESSION_TTL_HOURS` | `168` | Retain idle `previous_response_id` history and reasoning state for this many hours |
+| `--max-sessions` | `CODEX_RELAY_MAX_SESSIONS` | `256` | Maximum completed response histories retained for continuation |
+| `--max-session-memory-mb` | `CODEX_RELAY_MAX_SESSION_MEMORY_MB` | `512` | Approximate memory budget for retained session/reasoning state |
 
 ## Supported providers
 
@@ -115,6 +118,9 @@ Any OpenAI-compatible endpoint works.
 | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
 | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations (e.g., `gpt-5.4:deepseek-v4-pro`) |
+| `CODEX_RELAY_SESSION_TTL_HOURS` | `168` | Retain idle session/reasoning state for this many hours |
+| `CODEX_RELAY_MAX_SESSIONS` | `256` | Maximum completed response histories retained for `previous_response_id` |
+| `CODEX_RELAY_MAX_SESSION_MEMORY_MB` | `512` | Approximate memory budget for retained session/reasoning state |
 | `RUST_LOG` | `codex_relay=info` | Log verbosity |
 
 ## Python API

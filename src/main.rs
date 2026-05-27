@@ -13,13 +13,16 @@ use axum::{
 };
 use clap::Parser;
 use reqwest::{Client, Url};
-use session::SessionStore;
+use session::{SessionStore, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_BYTES, DEFAULT_SESSION_TTL};
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 use types::*;
 
 #[derive(Parser, Debug)]
-#[command(name = "codex-relay", about = "Responses API ↔ Chat Completions bridge")]
+#[command(
+    name = "codex-relay",
+    about = "Responses API ↔ Chat Completions bridge"
+)]
 struct Args {
     #[arg(long, env = "CODEX_RELAY_PORT", default_value = "4444")]
     port: u16,
@@ -38,6 +41,30 @@ struct Args {
     /// for all models exposed by the upstream provider.
     #[arg(long)]
     print_config: bool,
+
+    /// Maximum completed response histories retained for previous_response_id.
+    #[arg(
+        long,
+        env = "CODEX_RELAY_MAX_SESSIONS",
+        default_value_t = DEFAULT_MAX_SESSIONS
+    )]
+    max_sessions: usize,
+
+    /// Approximate memory budget for retained session/reasoning state, in MiB.
+    #[arg(
+        long,
+        env = "CODEX_RELAY_MAX_SESSION_MEMORY_MB",
+        default_value_t = DEFAULT_MAX_SESSION_BYTES / 1024 / 1024
+    )]
+    max_session_memory_mb: usize,
+
+    /// Retain idle session/reasoning state for this many hours.
+    #[arg(
+        long,
+        env = "CODEX_RELAY_SESSION_TTL_HOURS",
+        default_value_t = DEFAULT_SESSION_TTL.as_secs() / 60 / 60
+    )]
+    session_ttl_hours: u64,
 }
 
 #[derive(Clone)]
@@ -69,27 +96,42 @@ async fn main() -> Result<()> {
         let provider_name = upstream
             .host_str()
             .map(|h| {
-            let h = h.trim_start_matches("api.").trim_start_matches("www.");
-            h.trim_end_matches(".com").trim_end_matches(".cn").trim_end_matches(".ai").trim_end_matches(".org").trim_end_matches(".io")
-        })
+                let h = h.trim_start_matches("api.").trim_start_matches("www.");
+                h.trim_end_matches(".com")
+                    .trim_end_matches(".cn")
+                    .trim_end_matches(".ai")
+                    .trim_end_matches(".org")
+                    .trim_end_matches(".io")
+            })
             .unwrap_or("custom");
         print_codex_config(&client, &upstream, &api_key, provider_name).await;
         return Ok(());
     }
 
+    let max_session_bytes = args
+        .max_session_memory_mb
+        .saturating_mul(1024)
+        .saturating_mul(1024);
+    let session_ttl = Duration::from_secs(args.session_ttl_hours.saturating_mul(60 * 60));
     let state = AppState {
-        sessions: SessionStore::new(),
+        sessions: SessionStore::with_limits_and_ttl(
+            args.max_sessions,
+            max_session_bytes,
+            session_ttl,
+        ),
         client: client.clone(),
         upstream: Arc::new(upstream.clone()),
         api_key: api_key.clone(),
     };
+    info!(
+        "session retention: ttl={}h max_sessions={} max_session_memory={} MiB",
+        args.session_ttl_hours, args.max_sessions, args.max_session_memory_mb
+    );
 
     // Fetch upstream model list asynchronously for user visibility
-    tokio::spawn(log_upstream_models(
-        client,
-        Arc::new(upstream),
-        api_key,
-    ));
+    tokio::spawn(log_upstream_models(client, Arc::new(upstream), api_key));
+
+    tokio::spawn(cleanup_sessions(state.sessions.clone()));
 
     // Disable axum's default 2 MiB body cap: Codex CLI may send base64-encoded
     // image attachments that easily exceed it, and a framework-level 413 looks
@@ -103,7 +145,10 @@ async fn main() -> Result<()> {
         .with_state(state.clone());
 
     let addr = format!("127.0.0.1:{}", args.port);
-    info!("codex-relay listening on {addr} → {}", state.upstream.as_ref());
+    info!(
+        "codex-relay listening on {addr} → {}",
+        state.upstream.as_ref()
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -149,10 +194,7 @@ async fn log_upstream_models(client: Client, upstream: Arc<Url>, api_key: Arc<St
                     .unwrap_or_default();
 
                 if !models.is_empty() {
-                    info!(
-                        "upstream models: {}",
-                        models.join(", ")
-                    );
+                    info!("upstream models: {}", models.join(", "));
                     info!(
                         "⚠️  To configure Codex with model metadata, run:  codex-relay --print-config --upstream {} {}",
                         upstream.as_str(),
@@ -161,20 +203,26 @@ async fn log_upstream_models(client: Client, upstream: Arc<Url>, api_key: Arc<St
                 }
             }
         }
-        Ok(Ok(r)) => warn!("upstream models: status {} (check credentials?)", r.status()),
+        Ok(Ok(r)) => warn!(
+            "upstream models: status {} (check credentials?)",
+            r.status()
+        ),
         Ok(Err(e)) => warn!("upstream models: request error: {e}"),
         Err(_elapsed) => warn!("upstream models: request timed out (upstream unreachable?)"),
     }
 }
 
+async fn cleanup_sessions(sessions: SessionStore) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+    loop {
+        interval.tick().await;
+        sessions.cleanup();
+    }
+}
+
 /// Print a Codex config.toml snippet that includes model_properties for all
 /// upstream models, so users can avoid "model metadata not found" warnings.
-async fn print_codex_config(
-    client: &Client,
-    upstream: &Url,
-    api_key: &str,
-    provider_name: &str,
-) {
+async fn print_codex_config(client: &Client, upstream: &Url, api_key: &str, provider_name: &str) {
     let url = format!("{}models", join_base(upstream));
     let mut builder = client.get(&url);
     if !api_key.is_empty() {
@@ -182,25 +230,23 @@ async fn print_codex_config(
     }
 
     let models: Vec<String> = match builder.send().await {
-        Ok(r) if r.status().is_success() => {
-            match r.json::<serde_json::Value>().await {
-                Ok(body) => body
-                    .get("data")
-                    .or_else(|| body.get("models"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                Err(e) => {
-                    eprintln!("// Failed to parse upstream models: {e}");
-                    eprintln!("// Falling back to a generic snippet. Replace <YOUR_MODEL> below.");
-                    vec!["<YOUR_MODEL>".into()]
-                }
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(body) => body
+                .get("data")
+                .or_else(|| body.get("models"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(e) => {
+                eprintln!("// Failed to parse upstream models: {e}");
+                eprintln!("// Falling back to a generic snippet. Replace <YOUR_MODEL> below.");
+                vec!["<YOUR_MODEL>".into()]
             }
-        }
+        },
         status => {
             eprintln!("// Failed to fetch upstream models (status: {status:?})");
             eprintln!("// Falling back to a generic snippet. Replace <YOUR_MODEL> below.");
@@ -224,14 +270,14 @@ async fn print_codex_config(
     println!();
     println!("[model_providers.{provider_name}]");
     println!("name = \"{}\"", provider_name);
-    println!(
-        "base_url = \"{}\"",
-        upstream.as_str().trim_end_matches('/')
-    );
+    println!("base_url = \"{}\"", upstream.as_str().trim_end_matches('/'));
     println!("wire_api = \"responses\"");
     println!(
         "env_key = \"{}_API_KEY\"",
-        provider_name.to_uppercase().replace('-', "_").replace('.', "_")
+        provider_name
+            .to_uppercase()
+            .replace('-', "_")
+            .replace('.', "_")
     );
     println!();
 
@@ -364,10 +410,7 @@ async fn handle_fallback(req: Request) -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
-async fn handle_responses(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-) -> Response {
+async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -560,5 +603,4 @@ mod tests {
         assert!(!props.supports_reasoning_summaries);
         assert!(props.supports_parallel_tool_calls);
     }
-
 }
