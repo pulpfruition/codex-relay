@@ -18,6 +18,8 @@ use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 use types::*;
 
+const DEBUG_NAME_LIMIT: usize = 80;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "codex-relay",
@@ -410,6 +412,88 @@ async fn handle_fallback(req: Request) -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
+fn summarize_debug_names(names: Vec<String>) -> String {
+    if names.is_empty() {
+        return "(none)".to_string();
+    }
+
+    let total = names.len();
+    let mut shown = names
+        .into_iter()
+        .take(DEBUG_NAME_LIMIT)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > DEBUG_NAME_LIMIT {
+        shown.push_str(&format!(", ... (+{} more)", total - DEBUG_NAME_LIMIT));
+    }
+    shown
+}
+
+fn response_tool_debug_names(tools: &[serde_json::Value]) -> Vec<String> {
+    let mut names = Vec::new();
+    for tool in tools {
+        match tool.get("type").and_then(serde_json::Value::as_str) {
+            Some("function") => {
+                if let Some(name) = tool
+                    .get("name")
+                    .or_else(|| tool.get("function").and_then(|f| f.get("name")))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    names.push(name.to_string());
+                }
+            }
+            Some("namespace") => {
+                let namespace = tool
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if let Some(subs) = tool.get("tools").and_then(serde_json::Value::as_array) {
+                    for sub in subs {
+                        if sub.get("type").and_then(serde_json::Value::as_str) == Some("function") {
+                            if let Some(name) = sub.get("name").and_then(serde_json::Value::as_str)
+                            {
+                                names.push(format!("{namespace}{name}"));
+                            }
+                        }
+                    }
+                }
+            }
+            Some(kind) => names.push(format!("<{kind}>")),
+            None => {}
+        }
+    }
+    names
+}
+
+fn chat_tool_debug_names(tools: &[serde_json::Value]) -> Vec<String> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            tool.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| tool.get("name").and_then(serde_json::Value::as_str))
+                .map(String::from)
+        })
+        .collect()
+}
+
+fn chat_response_tool_call_debug_names(chat_resp: &ChatResponse) -> Vec<String> {
+    chat_resp
+        .choices
+        .iter()
+        .flat_map(|choice| choice.message.tool_calls.iter())
+        .flatten()
+        .filter_map(|tool_call| {
+            tool_call
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+        })
+        .collect()
+}
+
 async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -433,6 +517,10 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
         req.tools.len(),
         req.previous_response_id
     );
+    debug!(
+        "→ response tools={}",
+        summarize_debug_names(response_tool_debug_names(&req.tools))
+    );
 
     handle_responses_inner(state, req).await
 }
@@ -446,6 +534,10 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
 
     let model = req.model.clone();
     let mut chat_req = translate::to_chat_request(&req, history.clone(), &state.sessions);
+    debug!(
+        "→ upstream tools={}",
+        summarize_debug_names(chat_tool_debug_names(&chat_req.tools))
+    );
     let url = format!("{}chat/completions", join_base(&state.upstream));
 
     if req.stream {
@@ -505,6 +597,10 @@ async fn handle_blocking(
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
             Ok(chat_resp) => {
+                debug!(
+                    "← upstream function_calls={}",
+                    summarize_debug_names(chat_response_tool_call_debug_names(&chat_resp))
+                );
                 let assistant_msg = chat_resp
                     .choices
                     .first()
@@ -532,6 +628,7 @@ async fn handle_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_validate_upstream_https() {
@@ -578,6 +675,60 @@ mod tests {
     fn test_join_base_preserves_trailing_slash() {
         let url = Url::parse("https://api.example.com/v1/").unwrap();
         assert_eq!(join_base(&url), "https://api.example.com/v1/");
+    }
+
+    #[test]
+    fn test_response_tool_debug_names_include_flat_and_namespace_tools() {
+        let tools = vec![
+            json!({"type": "function", "name": "spawn_agent"}),
+            json!({
+                "type": "namespace",
+                "name": "mcp__codex_apps__github",
+                "tools": [
+                    {"type": "function", "name": "_fetch_issue"},
+                    {"type": "web_search"}
+                ]
+            }),
+            json!({"type": "web_search"}),
+        ];
+
+        assert_eq!(
+            response_tool_debug_names(&tools),
+            vec![
+                "spawn_agent".to_string(),
+                "mcp__codex_apps__github_fetch_issue".to_string(),
+                "<web_search>".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_chat_response_tool_call_debug_names_do_not_include_arguments() {
+        let chat_resp = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent",
+                            "arguments": "{\"task\":\"secret\"}"
+                        }
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+
+        assert_eq!(
+            chat_response_tool_call_debug_names(&chat_resp),
+            vec!["spawn_agent".to_string()]
+        );
     }
 
     #[test]

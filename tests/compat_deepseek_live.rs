@@ -28,7 +28,9 @@ const RELAY_BIN: &str = env!("CARGO_BIN_EXE_codex-relay");
 const DEEPSEEK_UPSTREAM: &str = "https://api.deepseek.com/v1";
 
 fn deepseek_key() -> Option<String> {
-    std::env::var("DEEPSEEK_API_KEY").ok().filter(|s| !s.is_empty())
+    std::env::var("DEEPSEEK_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn pick_port() -> u16 {
@@ -287,7 +289,9 @@ async fn assert_streaming_chat(model: &str) {
     let full: String = text_chunks.join("");
     if !full.trim().is_empty() {
         assert!(
-            event_types.iter().any(|e| e == "response.output_item.added"),
+            event_types
+                .iter()
+                .any(|e| e == "response.output_item.added"),
             "non-empty text but no output_item.added: {event_types:?}"
         );
         assert!(
@@ -486,8 +490,8 @@ async fn proxy_handler(
 
     match rb.send().await {
         Ok(upstream) => {
-            let status = StatusCode::from_u16(upstream.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut builder = Response::builder().status(status);
             for (k, v) in upstream.headers().iter() {
                 let kn = k.as_str().to_lowercase();
@@ -509,10 +513,7 @@ async fn proxy_handler(
     }
 }
 
-async fn spawn_recording_proxy(
-    upstream_base: &str,
-    auth: &str,
-) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
+async fn spawn_recording_proxy(upstream_base: &str, auth: &str) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
     let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let state = RecordingProxyState {
         upstream_base: Arc::new(upstream_base.to_string()),
@@ -622,8 +623,7 @@ async fn live_deepseek_v4_pro_reasoning_round_trip() {
     });
 
     let (fc, _events1) = streaming_call(&relay.url("/v1/responses"), turn1).await;
-    let (call_id, name, arguments) =
-        fc.expect("turn 1 must produce a function_call from v4-pro");
+    let (call_id, name, arguments) = fc.expect("turn 1 must produce a function_call from v4-pro");
     assert_eq!(name, "get_weather");
     assert!(!call_id.is_empty(), "call_id must be non-empty");
 
@@ -807,7 +807,10 @@ async fn live_deepseek_v4_pro_image_input_wire_shape() {
     });
     assert!(has_text, "missing text part: {parts:?}");
     assert!(has_image, "missing image_url part: {parts:?}");
-    eprintln!("✓ outbound multimodal shape verified ({} parts)", parts.len());
+    eprintln!(
+        "✓ outbound multimodal shape verified ({} parts)",
+        parts.len()
+    );
 }
 
 /// Companion to the wire-shape test: confirm the symptom of DeepSeek's

@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     session::SessionStore,
@@ -34,6 +34,18 @@ struct ToolCallAccum {
     id: String,
     name: String,
     arguments: String,
+}
+
+fn summarize_stream_tool_call_names(tool_calls: &BTreeMap<usize, ToolCallAccum>) -> String {
+    if tool_calls.is_empty() {
+        return "(none)".to_string();
+    }
+
+    tool_calls
+        .values()
+        .map(|tc| tc.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Translate an upstream Chat Completions SSE stream into a Responses API SSE stream.
@@ -209,6 +221,10 @@ pub fn translate_stream(
         // Emit function_call items for each accumulated tool call
         let base_index: usize = if emitted_message_item { 1 } else { 0 };
         let mut fc_items: Vec<Value> = Vec::new();
+        debug!(
+            "← upstream stream function_calls={}",
+            summarize_stream_tool_call_names(&tool_calls)
+        );
 
         for (rel_idx, (_, tc)) in tool_calls.iter().enumerate() {
             let fc_item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());

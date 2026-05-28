@@ -55,7 +55,11 @@ fn test_deepseek_v4_pro_reasoning_roundtrip_text_only() {
 
     // Simulate turn 1: model returned text + reasoning
     let assistant = assistant_msg("Let me analyze this");
-    store.store_turn_reasoning(&[], &assistant, "<think>analyzing the problem...</think>".into());
+    store.store_turn_reasoning(
+        &[],
+        &assistant,
+        "<think>analyzing the problem...</think>".into(),
+    );
 
     // Turn 2: Codex replays full conversation history as input items
     let req = base_req(ResponsesInput::Messages(vec![
@@ -96,11 +100,7 @@ fn test_deepseek_v4_pro_reasoning_roundtrip_with_tool_calls() {
             "function": {"name": "exec_command", "arguments": "{\"cmd\": \"ls\"}"}
         })],
     );
-    store.store_turn_reasoning(
-        &[],
-        &assistant,
-        "<think>need to read files</think>".into(),
-    );
+    store.store_turn_reasoning(&[], &assistant, "<think>need to read files</think>".into());
 
     // Turn 2: Codex replays conversation with separate items
     let req = base_req(ResponsesInput::Messages(vec![
@@ -147,11 +147,19 @@ fn test_deepseek_v4_pro_multi_turn_reasoning() {
 
     // Store reasoning for turn 1
     let assistant1 = assistant_msg("Step 1 analysis");
-    store.store_turn_reasoning(&[], &assistant1, "<think>first pass thinking</think>".into());
+    store.store_turn_reasoning(
+        &[],
+        &assistant1,
+        "<think>first pass thinking</think>".into(),
+    );
 
     // Store reasoning for turn 2
     let assistant2 = assistant_msg("Step 2 deeper look");
-    store.store_turn_reasoning(&[], &assistant2, "<think>second pass thinking</think>".into());
+    store.store_turn_reasoning(
+        &[],
+        &assistant2,
+        "<think>second pass thinking</think>".into(),
+    );
 
     // Turn 3: Codex replays the full 2-turn history
     let req = base_req(ResponsesInput::Messages(vec![

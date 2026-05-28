@@ -138,6 +138,25 @@ proc.terminate()
 Two layers — offline tests pin behavior against captured Codex wire-shape;
 live tests pin behavior against real provider APIs.
 
+## Debugging tool round-trips
+
+For tool-routing issues, enable debug logs:
+
+```bash
+RUST_LOG=codex_relay=debug codex-relay
+```
+
+The relay logs tool names only, never tool arguments or message content:
+
+- `response tools=...` — tools received from Codex's Responses API request
+- `upstream tools=...` — tools forwarded to the Chat Completions upstream
+- `upstream function_calls=...` — function calls returned by a blocking upstream response
+- `upstream stream function_calls=...` — function calls returned by a streaming upstream response
+
+These lines are useful for checking whether a tool such as `spawn_agent`
+was preserved by the relay, and whether the failure happened before or after
+the model selected that tool.
+
 **Offline (always green, default `cargo test`)**
 
 Replays Codex CLI fixtures through the translation layer and asserts

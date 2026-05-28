@@ -24,7 +24,9 @@ const KIMI_UPSTREAM: &str = "https://api.moonshot.cn/v1";
 const TINY_RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 fn moonshot_key() -> Option<String> {
-    std::env::var("MOONSHOT_API_KEY").ok().filter(|s| !s.is_empty())
+    std::env::var("MOONSHOT_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn need_key() -> Option<String> {
