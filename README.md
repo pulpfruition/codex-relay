@@ -255,7 +255,8 @@ This project is **not affiliated with, endorsed by, or sponsored by OpenAI**. "C
 ## Contributors
 
 - [myk5010](https://github.com/myk5010) — system/developer message ordering fix and model name mapping ([\#4](https://github.com/MetaFARS/codex-relay/pull/4))
-- [qcnhy](https://github.com/qcnhy) — streaming usage and MCP namespace bug reports plus independent verification ([\#5](https://github.com/MetaFARS/codex-relay/issues/5), [\#6](https://github.com/MetaFARS/codex-relay/issues/6))
+- [qcnhy](https://github.com/qcnhy) — streaming usage, MCP namespace bug reports, namespace tool-routing analysis, and independent verification ([\#5](https://github.com/MetaFARS/codex-relay/issues/5), [\#6](https://github.com/MetaFARS/codex-relay/issues/6), [\#17](https://github.com/MetaFARS/codex-relay/issues/17))
+- [JasonC93](https://github.com/JasonC93) — subagent tool-routing and spawned-agent context isolation reports ([\#10](https://github.com/MetaFARS/codex-relay/issues/10), [\#12](https://github.com/MetaFARS/codex-relay/issues/12))
 
 ## License
 
