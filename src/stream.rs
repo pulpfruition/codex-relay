@@ -48,11 +48,58 @@ fn summarize_stream_tool_call_names(tool_calls: &BTreeMap<usize, ToolCallAccum>)
         .join(", ")
 }
 
+/// Heuristic: extract a clean section title from the first **bold** header
+/// in the reasoning text.
+///
+/// DeepSeek/GLM: "1.  **Analyze the Input:**" → "Analyze the Input"
+/// Claude-style prose headers like "**The user wants to:**" are rejected.
+fn heuristic_title(reasoning: &str) -> Option<String> {
+    let trimmed = reasoning.trim();
+    if let Some(open) = trimmed.find("**") {
+        let after = &trimmed[open + 2..];
+        if let Some(close) = after.find("**") {
+            let inner = after[..close].trim();
+            let lower = inner.to_lowercase();
+            let is_prose = inner.contains('\n')
+                || lower.starts_with("the user")
+                || lower.starts_with("i need")
+                || lower.starts_with("i should")
+                || lower.starts_with("i will")
+                || lower.starts_with("i am")
+                || lower.starts_with("let me")
+                || lower.starts_with("we need")
+                || lower.starts_with("we are");
+            if !is_prose && !inner.is_empty() && inner.len() <= 60 {
+                let title = inner.trim_end_matches(':').trim();
+                if !title.is_empty() {
+                    return Some(title.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build the display string for a reasoning block in the TUI.
+/// Uses heuristic title extraction when available; falls back to "Thinking".
+fn make_display_reasoning(reasoning: &str) -> String {
+    let trimmed = reasoning.trim();
+    if let Some(title) = heuristic_title(trimmed) {
+        format!("**{}**\n\n{}", title, trimmed)
+    } else {
+        format!("**Thinking**\n\n{}", trimmed)
+    }
+}
+
 /// Translate an upstream Chat Completions SSE stream into a Responses API SSE stream.
 ///
 /// Text response event sequence:
 ///   response.created → response.output_item.added (message) → response.output_text.delta*
 ///   → response.output_item.done → response.completed
+///
+/// With reasoning:
+///   response.created → reasoning items (index 0) → message items (index 1) →
+///   tool calls → response.completed
 ///
 /// Tool call response event sequence:
 ///   response.created → [accumulate deltas] → response.output_item.added (function_call)
@@ -107,8 +154,9 @@ pub fn translate_stream(
 
         let mut accumulated_text = String::new();
         let mut accumulated_reasoning = String::new();
+        let mut reasoning_emitted = false;
+        let mut message_started = false;
         let mut tool_calls: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
-        let mut emitted_message_item = false;
         let mut stream_done = false;
         let mut stream_usage: Option<ChatUsage> = None;
         let mut source = upstream.bytes_stream().eventsource();
@@ -133,22 +181,41 @@ pub fn translate_stream(
                                 stream_usage = usage;
                             }
                             for choice in &choices {
-                                // Reasoning/thinking content (kimi-k2.6 etc.)
+                                // Reasoning/thinking content (kimi-k2.6, DeepSeek, etc.)
                                 if let Some(rc) = choice.delta.reasoning_content.as_deref() {
                                     if !rc.is_empty() {
                                         accumulated_reasoning.push_str(rc);
                                     }
                                 }
 
-                                // Text content
+                                // Text content — emit reasoning first, then per-chunk text deltas
                                 let content = choice.delta.content.as_deref().unwrap_or("");
                                 if !content.is_empty() {
-                                    if !emitted_message_item {
+                                    accumulated_text.push_str(content);
+
+                                    // Emit reasoning items before the first text chunk
+                                    if !reasoning_emitted && !accumulated_reasoning.is_empty() {
+                                        let rid = format!("rs_{}", uuid::Uuid::new_v4().simple());
+                                        let display = make_display_reasoning(&accumulated_reasoning);
+                                        yield Ok(Event::default().event("response.output_item.added").data(
+                                            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":&rid,"status":"in_progress","summary":[]}}).to_string()));
+                                        yield Ok(Event::default().event("response.reasoning_summary_part.added").data(
+                                            json!({"type":"response.reasoning_summary_part.added","item_id":&rid,"output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}).to_string()));
+                                        yield Ok(Event::default().event("response.reasoning_summary_text.delta").data(
+                                            json!({"type":"response.reasoning_summary_text.delta","item_id":&rid,"output_index":0,"summary_index":0,"delta":&display}).to_string()));
+                                        yield Ok(Event::default().event("response.output_item.done").data(
+                                            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":&rid,"status":"completed","summary":[{"type":"summary_text","text":&display}],"content":[{"type":"reasoning_text","text":&accumulated_reasoning}],"encrypted_content":null}}).to_string()));
+                                        reasoning_emitted = true;
+                                    }
+
+                                    // Emit message output_item.added on first content chunk
+                                    if !message_started {
+                                        let msg_idx: usize = if accumulated_reasoning.is_empty() { 0 } else { 1 };
                                         yield Ok(Event::default()
                                             .event("response.output_item.added")
                                             .data(json!({
                                                 "type": "response.output_item.added",
-                                                "output_index": 0,
+                                                "output_index": msg_idx,
                                                 "item": {
                                                     "type": "message",
                                                     "id": &msg_item_id,
@@ -157,15 +224,16 @@ pub fn translate_stream(
                                                     "content": []
                                                 }
                                             }).to_string()));
-                                        emitted_message_item = true;
+                                        message_started = true;
                                     }
-                                    accumulated_text.push_str(content);
+
+                                    let msg_idx: usize = if accumulated_reasoning.is_empty() { 0 } else { 1 };
                                     yield Ok(Event::default()
                                         .event("response.output_text.delta")
                                         .data(json!({
                                             "type": "response.output_text.delta",
                                             "item_id": &msg_item_id,
-                                            "output_index": 0,
+                                            "output_index": msg_idx,
                                             "delta": content
                                         }).to_string()));
                                 }
@@ -202,12 +270,35 @@ pub fn translate_stream(
             }
         }
 
-        if let Some(msg_item_id) = (emitted_message_item).then(|| msg_item_id.clone()) {
+        // If we accumulated reasoning but never saw text, emit reasoning now
+        // (tool-call-only turns, e.g. DeepSeek thinking before tool call)
+        if !reasoning_emitted && !accumulated_reasoning.is_empty() {
+            let rid = format!("rs_{}", uuid::Uuid::new_v4().simple());
+            let display = make_display_reasoning(&accumulated_reasoning);
+            yield Ok(Event::default().event("response.output_item.added").data(
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":&rid,"status":"in_progress","summary":[]}}).to_string()));
+            yield Ok(Event::default().event("response.reasoning_summary_part.added").data(
+                json!({"type":"response.reasoning_summary_part.added","item_id":&rid,"output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}).to_string()));
+            yield Ok(Event::default().event("response.reasoning_summary_text.delta").data(
+                json!({"type":"response.reasoning_summary_text.delta","item_id":&rid,"output_index":0,"summary_index":0,"delta":&display}).to_string()));
+            yield Ok(Event::default().event("response.output_item.done").data(
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":&rid,"status":"completed","summary":[{"type":"summary_text","text":&display}],"content":[{"type":"reasoning_text","text":&accumulated_reasoning}],"encrypted_content":null}}).to_string()));
+            let _ = reasoning_emitted;
+        }
+
+        // Determine output indices for remaining items
+        let has_reasoning = !accumulated_reasoning.is_empty();
+        let has_text = message_started;
+        let message_index: usize = if has_reasoning { 1 } else { 0 };
+        let fc_base: usize = if has_reasoning && has_text { 2 } else if has_text || has_reasoning { 1 } else { 0 };
+
+        // Emit message output_item.done
+        if has_text {
             yield Ok(Event::default()
                 .event("response.output_item.done")
                 .data(json!({
                     "type": "response.output_item.done",
-                    "output_index": 0,
+                    "output_index": message_index,
                     "item": {
                         "type": "message",
                         "id": &msg_item_id,
@@ -219,7 +310,6 @@ pub fn translate_stream(
         }
 
         // Emit function_call items for each accumulated tool call
-        let base_index: usize = if emitted_message_item { 1 } else { 0 };
         let mut fc_items: Vec<Value> = Vec::new();
         debug!(
             "← upstream stream function_calls={}",
@@ -228,7 +318,7 @@ pub fn translate_stream(
 
         for (rel_idx, (_, tc)) in tool_calls.iter().enumerate() {
             let fc_item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
-            let output_index = base_index + rel_idx;
+            let output_index = fc_base + rel_idx;
             let (namespace, name) = split_mcp_function_name(&tc.name);
             let mut added_item = json!({
                 "type": "function_call",
@@ -300,10 +390,16 @@ pub fn translate_stream(
                     "function": { "name": &tc.name, "arguments": &tc.arguments }
                 })).collect())
             };
+            // Round-trip reasoning_content only on tool-call turns.
+            // On text-only turns: DeepSeek ignores it (harmless but wasteful), Claude
+            // re-emits the full accumulated thinking causing exponential token growth.
+            // On tool-call turns: both DeepSeek and Claude require it for continuity
+            // (missing it returns a 400 from DeepSeek; breaks reasoning flow on Claude).
+            let has_tool_calls = !tool_calls.is_empty();
             let assistant_msg = ChatMessage {
                 role: "assistant".into(),
                 content: if accumulated_text.is_empty() { None } else { Some(serde_json::Value::String(accumulated_text.clone())) },
-                reasoning_content: if accumulated_reasoning.is_empty() { None } else { Some(accumulated_reasoning.clone()) },
+                reasoning_content: if accumulated_reasoning.is_empty() || !has_tool_calls { None } else { Some(accumulated_reasoning.clone()) },
                 tool_calls: assistant_tool_calls,
                 tool_call_id: None,
                 name: None,
@@ -321,9 +417,20 @@ pub fn translate_stream(
             messages.push(assistant_msg);
             sessions.save_with_id(response_id.clone(), messages);
 
-            // Build output array for response.completed
+            // Build output array for response.completed: reasoning first, then message, then tool calls.
             let mut output_items: Vec<Value> = Vec::new();
-            if emitted_message_item {
+            if has_reasoning {
+                let r_display = make_display_reasoning(&accumulated_reasoning);
+                output_items.push(json!({
+                    "type": "reasoning",
+                    "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": r_display}],
+                    "content": [{"type": "reasoning_text", "text": &accumulated_reasoning}],
+                    "encrypted_content": null
+                }));
+            }
+            if has_text {
                 output_items.push(json!({
                     "type": "message",
                     "id": &msg_item_id,
