@@ -148,7 +148,7 @@ pub struct ChatDelta {
     #[allow(dead_code)]
     pub role: Option<String>,
     pub content: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "reasoning")]
     pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<DeltaToolCall>>,
