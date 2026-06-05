@@ -336,6 +336,7 @@ pub fn translate_stream(
             }
             output_items.extend(fc_items);
             let usage = stream_usage.unwrap_or_default();
+            debug!("cache(stream): {}", usage.cache_summary());
 
             yield Ok(Event::default()
                 .event("response.completed")

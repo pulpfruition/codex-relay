@@ -429,6 +429,7 @@ pub fn from_chat_response_with_tool_map(
         });
 
     let usage = chat.usage.unwrap_or_default();
+    tracing::debug!("cache(non-stream): {}", usage.cache_summary());
     let mut output = Vec::new();
 
     let text = choice.message.text_content().to_string();

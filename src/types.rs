@@ -125,6 +125,53 @@ pub struct ChatUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    // Prompt-cache accounting. Providers disagree on the shape:
+    //   DeepSeek / packyapi: top-level prompt_cache_{hit,miss}_tokens
+    //   OpenAI-compatible:   prompt_tokens_details.cached_tokens
+    // Capture both; normalize via cache_hit()/cache_miss().
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: Option<u32>,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
+}
+
+impl ChatUsage {
+    /// Cached (hit) prompt tokens. Prefers the DeepSeek-style top-level field,
+    /// else falls back to the OpenAI-style `prompt_tokens_details.cached_tokens`.
+    fn cache_hit(&self) -> u32 {
+        self.prompt_cache_hit_tokens
+            .or_else(|| self.prompt_tokens_details.as_ref().map(|d| d.cached_tokens))
+            .unwrap_or(0)
+    }
+
+    /// Non-cached (miss) prompt tokens; falls back to `prompt_tokens - hit`.
+    fn cache_miss(&self) -> u32 {
+        self.prompt_cache_miss_tokens
+            .unwrap_or_else(|| self.prompt_tokens.saturating_sub(self.cache_hit()))
+    }
+
+    /// One-line prompt-cache summary for debug logging, e.g.
+    /// `hit=1152 miss=51 prompt=1203 hit_rate=95.8%`.
+    pub fn cache_summary(&self) -> String {
+        let (hit, prompt) = (self.cache_hit(), self.prompt_tokens);
+        let rate = if prompt > 0 {
+            100.0 * hit as f64 / prompt as f64
+        } else {
+            0.0
+        };
+        format!(
+            "hit={hit} miss={} prompt={prompt} hit_rate={rate:.1}%",
+            self.cache_miss()
+        )
+    }
 }
 
 // ── SSE streaming types ───────────────────────────────────────────────────────
