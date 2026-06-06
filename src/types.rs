@@ -217,3 +217,70 @@ pub struct DeltaFunction {
     #[serde(default)]
     pub arguments: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ChatUsage;
+    use serde_json::json;
+
+    #[test]
+    fn cache_summary_uses_deepseek_top_level_cache_fields() {
+        let usage: ChatUsage = serde_json::from_value(json!({
+            "prompt_tokens": 1203,
+            "completion_tokens": 25,
+            "total_tokens": 1228,
+            "prompt_cache_hit_tokens": 1152,
+            "prompt_cache_miss_tokens": 51
+        }))
+        .unwrap();
+
+        assert_eq!(
+            usage.cache_summary(),
+            "hit=1152 miss=51 prompt=1203 hit_rate=95.8%"
+        );
+    }
+
+    #[test]
+    fn cache_summary_uses_openai_prompt_tokens_details() {
+        let usage: ChatUsage = serde_json::from_value(json!({
+            "prompt_tokens": 893,
+            "completion_tokens": 12,
+            "total_tokens": 905,
+            "prompt_tokens_details": {
+                "cached_tokens": 640
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            usage.cache_summary(),
+            "hit=640 miss=253 prompt=893 hit_rate=71.7%"
+        );
+    }
+
+    #[test]
+    fn cache_summary_prefers_top_level_hit_when_both_shapes_exist() {
+        let usage: ChatUsage = serde_json::from_value(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110,
+            "prompt_cache_hit_tokens": 25,
+            "prompt_tokens_details": {
+                "cached_tokens": 90
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            usage.cache_summary(),
+            "hit=25 miss=75 prompt=100 hit_rate=25.0%"
+        );
+    }
+
+    #[test]
+    fn cache_summary_handles_missing_usage_fields() {
+        let usage = ChatUsage::default();
+
+        assert_eq!(usage.cache_summary(), "hit=0 miss=0 prompt=0 hit_rate=0.0%");
+    }
+}
