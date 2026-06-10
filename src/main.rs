@@ -29,6 +29,9 @@ struct Args {
     #[arg(long, env = "CODEX_RELAY_PORT", default_value = "4444")]
     port: u16,
 
+    #[arg(long, env = "CODEX_RELAY_HOST", default_value = "0.0.0.0")]
+    host: String,
+
     #[arg(
         long,
         env = "CODEX_RELAY_UPSTREAM",
@@ -138,7 +141,7 @@ async fn main() -> Result<()> {
     // Disable axum's default 2 MiB body cap: Codex CLI may send base64-encoded
     // image attachments that easily exceed it, and a framework-level 413 looks
     // like a transport-layer death to Codex and crashes the session (#2).
-    // The relay only binds 127.0.0.1, so DoS isn't a concern here.
+
     let app = Router::new()
         .route("/v1/responses", post(handle_responses))
         .route("/v1/models", get(handle_models))
@@ -146,7 +149,7 @@ async fn main() -> Result<()> {
         .layer(DefaultBodyLimit::disable())
         .with_state(state.clone());
 
-    let addr = format!("127.0.0.1:{}", args.port);
+    let addr = format!("{}:{}", args.host, args.port);
     info!(
         "codex-relay listening on {addr} → {}",
         state.upstream.as_ref()
