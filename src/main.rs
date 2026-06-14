@@ -520,7 +520,21 @@ fn chat_response_tool_call_debug_names(chat_resp: &ChatResponse) -> Vec<String> 
         .collect()
 }
 
-async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+async fn handle_responses(State(state): State<AppState>, req: Request) -> Response {
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("body read error: {e}");
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
+
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -548,10 +562,10 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
         summarize_debug_names(response_tool_debug_names(&req.tools))
     );
 
-    handle_responses_inner(state, req).await
+    handle_responses_inner(state, req, auth_header).await
 }
 
-async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Response {
+async fn handle_responses_inner(state: AppState, req: ResponsesRequest, auth_header: Option<String>) -> Response {
     let mut history = req
         .previous_response_id
         .as_deref()
@@ -571,6 +585,14 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
     );
     let url = format!("{}chat/completions", join_base(&state.upstream));
 
+    let effective_auth = auth_header.or_else(|| {
+        if !state.api_key.is_empty() {
+            Some(format!("Bearer {}", state.api_key))
+        } else {
+            None
+        }
+    });
+
     if req.stream {
         let response_id = state.sessions.new_id();
         chat_req.stream = true;
@@ -578,7 +600,7 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
         stream::translate_stream(stream::StreamArgs {
             client: state.client,
             url,
-            api_key: state.api_key,
+            auth_header: effective_auth,
             chat_req,
             response_id,
             sessions: state.sessions,
@@ -589,7 +611,7 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
         .into_response()
     } else {
         chat_req.stream = false;
-        handle_blocking(state, chat_req, url, model, namespace_tools).await
+        handle_blocking(state, chat_req, url, model, namespace_tools, effective_auth).await
     }
 }
 
@@ -660,14 +682,15 @@ async fn handle_blocking(
     url: String,
     model: String,
     namespace_tools: translate::NamespaceToolMap,
+    auth_header: Option<String>,
 ) -> Response {
     let mut builder = state
         .client
         .post(&url)
         .header("Content-Type", "application/json");
 
-    if !state.api_key.is_empty() {
-        builder = builder.bearer_auth(state.api_key.as_str());
+    if let Some(auth) = auth_header {
+        builder = builder.header("Authorization", auth);
     }
 
     match builder.json(&chat_req).send().await {

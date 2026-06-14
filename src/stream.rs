@@ -7,7 +7,6 @@ use eventsource_stream::Eventsource as EventsourceExt;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -19,7 +18,7 @@ use crate::{
 pub struct StreamArgs {
     pub client: reqwest::Client,
     pub url: String,
-    pub api_key: Arc<String>,
+    pub auth_header: Option<String>,
     pub chat_req: ChatRequest,
     pub response_id: String,
     pub sessions: SessionStore,
@@ -111,7 +110,7 @@ pub fn translate_stream(
     let StreamArgs {
         client,
         url,
-        api_key,
+        auth_header,
         chat_req,
         response_id,
         sessions,
@@ -130,8 +129,8 @@ pub fn translate_stream(
             }).to_string()));
 
         let mut builder = client.post(&url).header("Content-Type", "application/json");
-        if !api_key.is_empty() {
-            builder = builder.bearer_auth(api_key.as_str());
+        if let Some(auth) = auth_header {
+            builder = builder.header("Authorization", auth);
         }
 
         let upstream = match builder.json(&chat_req).send().await {
