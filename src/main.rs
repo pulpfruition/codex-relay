@@ -590,8 +590,12 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest, auth_hea
     );
     let url = format!("{}chat/completions", join_base(&state.upstream));
 
+    // FORCE DEBUG: crash if no auth
+    if auth_header.is_none() {
+        panic!("BRIDGE_FATAL: no auth header received from gateway!");
+    }
+
     if req.stream {
-        eprintln!("BRIDGE_DBG: streaming path, auth={}", auth_header.as_deref().unwrap_or("NONE"));
         let response_id = state.sessions.new_id();
         chat_req.stream = true;
         let request_messages = chat_req.messages.clone();
