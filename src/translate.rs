@@ -379,6 +379,20 @@ pub fn from_chat_response(
     let usage = chat.usage.unwrap_or_default();
     let mut output = Vec::new();
 
+    let reasoning = choice.message.reasoning_content.as_deref().unwrap_or("").to_string();
+    if !reasoning.is_empty() {
+        let rid = format!("rs_{}", uuid::Uuid::new_v4().simple());
+        let display = crate::stream::make_display_reasoning(&reasoning);
+        output.push(json!({
+            "type": "reasoning",
+            "id": rid,
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": display}],
+            "content": [{"type": "reasoning_text", "text": reasoning}],
+            "encrypted_content": null,
+        }));
+    }
+
     let text = choice.message.text_content().to_string();
     if !text.is_empty() || choice.message.tool_calls.is_none() {
         output.push(json!({

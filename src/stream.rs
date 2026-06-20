@@ -7,7 +7,6 @@ use eventsource_stream::Eventsource as EventsourceExt;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -19,13 +18,10 @@ use crate::{
 pub struct StreamArgs {
     pub client: reqwest::Client,
     pub url: String,
-    pub api_key: Arc<String>,
+    pub auth_header: Option<String>,
     pub chat_req: ChatRequest,
     pub response_id: String,
     pub sessions: SessionStore,
-    /// The fully translated request messages (including replayed history).
-    /// Used to save correct session history so turn-level reasoning can be
-    /// recovered when Codex replays the conversation without previous_response_id.
     pub request_messages: Vec<ChatMessage>,
     pub model: String,
 }
@@ -82,7 +78,7 @@ fn heuristic_title(reasoning: &str) -> Option<String> {
 
 /// Build the display string for a reasoning block in the TUI.
 /// Uses heuristic title extraction when available; falls back to "Thinking".
-fn make_display_reasoning(reasoning: &str) -> String {
+pub fn make_display_reasoning(reasoning: &str) -> String {
     let trimmed = reasoning.trim();
     if let Some(title) = heuristic_title(trimmed) {
         format!("**{}**\n\n{}", title, trimmed)
@@ -110,12 +106,13 @@ pub fn translate_stream(
     let StreamArgs {
         client,
         url,
-        api_key,
+        auth_header,
         chat_req,
         response_id,
         sessions,
         request_messages,
         model,
+        ..
     } = args;
     let msg_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
@@ -128,8 +125,8 @@ pub fn translate_stream(
             }).to_string()));
 
         let mut builder = client.post(&url).header("Content-Type", "application/json");
-        if !api_key.is_empty() {
-            builder = builder.bearer_auth(api_key.as_str());
+        if let Some(auth) = auth_header {
+            builder = builder.header("Authorization", auth);
         }
 
         let upstream = match builder.json(&chat_req).send().await {
