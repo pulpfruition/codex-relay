@@ -526,6 +526,9 @@ async fn handle_responses(State(state): State<AppState>, req: Request) -> Respon
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    tracing::info!("handle_responses: auth_header present={}, len={:?}",
+        auth_header.is_some(),
+        auth_header.as_ref().map(|s| s.len()));
 
     let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(b) => b,
