@@ -454,20 +454,28 @@ pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
         }
     }
 
-    let Some(rest) = name.strip_prefix("mcp__") else {
-        return (None, name.to_string());
-    };
-    let Some(server_end) = rest.find("__") else {
-        return (None, name.to_string());
-    };
-    let split_at = "mcp__".len() + server_end + "__".len();
-    if split_at >= name.len() {
-        return (None, name.to_string());
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        if let Some(server_end) = rest.find("__") {
+            let split_at = "mcp__".len() + server_end + "__".len();
+            if split_at < name.len() {
+                return (
+                    Some(name[..split_at].to_string()),
+                    name[split_at..].to_string(),
+                );
+            }
+        }
     }
-    (
-        Some(name[..split_at].to_string()),
-        name[split_at..].to_string(),
-    )
+
+    if let Some(sep) = name.rfind("__") {
+        if sep > 0 {
+            let (ns, child) = name.split_at(sep);
+            if !ns.is_empty() && !child.is_empty() {
+                return (Some(ns.to_string()), child[2..].to_string());
+            }
+        }
+    }
+
+    (None, name.to_string())
 }
 
 /// Translate a Responses-API `content` value to its Chat Completions equivalent.
