@@ -89,7 +89,7 @@ pub struct ChatMessage {
     pub content: Option<Value>,
     /// Reasoning/thinking content emitted by models like kimi-k2.6.
     /// Must be round-tripped back when replaying tool call history.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<Value>>,
