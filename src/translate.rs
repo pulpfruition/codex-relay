@@ -352,7 +352,7 @@ fn response_function_name_for_chat(item: &Value) -> String {
 }
 
 pub(crate) fn chat_function_name_for_namespace_tool(namespace: &str, name: &str) -> String {
-    format!("{namespace}.{name}")
+    format!("{namespace}__{name}")
 }
 
 /// Convert a Chat Completions response into a Responses API response.
