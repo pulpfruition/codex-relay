@@ -17,6 +17,7 @@ fn base_req(input: ResponsesInput) -> ResponsesRequest {
         input,
         previous_response_id: None,
         tools: vec![],
+        tool_choice: None,
         stream: false,
         temperature: None,
         max_output_tokens: None,

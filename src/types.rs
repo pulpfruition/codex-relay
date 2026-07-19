@@ -12,6 +12,8 @@ pub struct ResponsesRequest {
     #[serde(default)]
     pub tools: Vec<Value>,
     #[serde(default)]
+    pub tool_choice: Option<Value>,
+    #[serde(default)]
     pub stream: bool,
     #[serde(default)]
     pub temperature: Option<f64>,
@@ -72,6 +74,8 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -565,7 +565,11 @@ async fn handle_responses(State(state): State<AppState>, req: Request) -> Respon
     handle_responses_inner(state, req, auth_header).await
 }
 
-async fn handle_responses_inner(state: AppState, req: ResponsesRequest, auth_header: Option<String>) -> Response {
+async fn handle_responses_inner(
+    state: AppState,
+    req: ResponsesRequest,
+    auth_header: Option<String>,
+) -> Response {
     let mut history = req
         .previous_response_id
         .as_deref()
@@ -864,6 +868,7 @@ mod tests {
             input: ResponsesInput::Text("child task".into()),
             previous_response_id: Some("resp_parent".into()),
             tools: vec![],
+            tool_choice: None,
             stream: false,
             temperature: None,
             max_output_tokens: None,
@@ -900,6 +905,7 @@ mod tests {
             })]),
             previous_response_id: Some("resp_parent".into()),
             tools: vec![],
+            tool_choice: None,
             stream: false,
             temperature: None,
             max_output_tokens: None,
@@ -932,6 +938,7 @@ mod tests {
             input: ResponsesInput::Text("child task".into()),
             previous_response_id: Some("resp_parent".into()),
             tools: vec![],
+            tool_choice: None,
             stream: false,
             temperature: None,
             max_output_tokens: None,

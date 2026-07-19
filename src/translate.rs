@@ -208,6 +208,7 @@ pub fn to_chat_request(
         model: map_model_name(&req.model),
         messages,
         tools: convert_tools(&req.tools),
+        tool_choice: convert_tool_choice(req.tool_choice.as_ref(), &namespace_tool_map(&req.tools)),
         temperature: req.temperature,
         max_tokens: req.max_output_tokens,
         stream_options: req.stream.then_some(ChatStreamOptions {
@@ -215,6 +216,52 @@ pub fn to_chat_request(
         }),
         stream: req.stream,
     }
+}
+
+/// Convert Responses API tool selection into Chat Completions shape.
+///
+/// Responses uses a flat function choice (`{type: "function", name: "foo"}`),
+/// while Chat Completions nests the name under `function`. Namespace tools also
+/// need the same flattened name used by `convert_tools`.
+fn convert_tool_choice(
+    choice: Option<&Value>,
+    namespace_tools: &NamespaceToolMap,
+) -> Option<Value> {
+    let Some(choice) = choice else {
+        return None;
+    };
+
+    let Value::Object(obj) = choice else {
+        return Some(choice.clone());
+    };
+
+    if obj.get("type").and_then(Value::as_str) != Some("function") {
+        return Some(choice.clone());
+    }
+
+    let raw_name = obj
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| obj.get("name").and_then(Value::as_str));
+    let Some(raw_name) = raw_name else {
+        return Some(choice.clone());
+    };
+
+    let chat_name = if let Some(namespace) = obj.get("namespace").and_then(Value::as_str) {
+        chat_function_name_for_namespace_tool(namespace, raw_name)
+    } else if namespace_tools.contains_key(raw_name) {
+        raw_name.to_string()
+    } else if let Some((namespace, name)) = raw_name.split_once('.') {
+        chat_function_name_for_namespace_tool(namespace, name)
+    } else {
+        raw_name.to_string()
+    };
+
+    Some(json!({
+        "type": "function",
+        "function": { "name": chat_name }
+    }))
 }
 
 /// Map model names via `CODEX_RELAY_MODEL_MAP` env var.
@@ -605,6 +652,7 @@ mod tests {
             input,
             previous_response_id: None,
             tools: vec![],
+            tool_choice: None,
             stream: false,
             temperature: None,
             max_output_tokens: None,
@@ -675,6 +723,52 @@ mod tests {
         assert_eq!(
             calls[0]["function"]["name"].as_str(),
             Some("mcp__node_repl-status")
+        );
+    }
+
+    #[test]
+    fn test_required_flat_function_choice_becomes_chat_choice() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hello".into()));
+        req.tools = vec![json!({
+            "type": "function",
+            "name": "get_probe_value",
+            "parameters": {"type": "object"}
+        })];
+        req.tool_choice = Some(json!({"type": "function", "name": "get_probe_value"}));
+
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(
+            chat.tool_choice,
+            Some(json!({
+                "type": "function",
+                "function": {"name": "get_probe_value"}
+            }))
+        );
+    }
+
+    #[test]
+    fn test_required_namespaced_function_choice_uses_chat_name() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hello".into()));
+        req.tools = vec![json!({
+            "type": "namespace",
+            "name": "mcp__node_repl",
+            "tools": [{"type": "function", "name": "status"}]
+        })];
+        req.tool_choice = Some(json!({
+            "type": "function",
+            "namespace": "mcp__node_repl",
+            "name": "status"
+        }));
+
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(
+            chat.tool_choice,
+            Some(json!({
+                "type": "function",
+                "function": {"name": "mcp__node_repl-status"}
+            }))
         );
     }
 
