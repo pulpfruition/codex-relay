@@ -10,7 +10,7 @@ Update this file whenever you regenerate fixtures or change the target model set
 | `codex_0_128_0/` | 0.128.0 | 2026-05-07 |
 
 Each fixture is a **minimized, hand-shrunk** representative of the real wire
-format — capture method documented at the top of `tests/compat_translate.rs`.
+format — capture method documented at the top of `tests/compat_codex_0_128.rs`.
 
 To regenerate after a Codex upgrade:
 
@@ -19,7 +19,7 @@ To regenerate after a Codex upgrade:
    `tests/fixtures/codex_<major>_<minor>_<patch>/` folder.
 2. Trim long strings and tool lists down to the smallest payload that still
    exercises the relevant feature.
-3. Add an entry above and update `tests/compat_translate.rs` to load it.
+3. Add an entry above and update `tests/compat_codex_0_128.rs` to load it.
 
 ## DeepSeek (live tests)
 

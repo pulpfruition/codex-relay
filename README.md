@@ -122,6 +122,8 @@ Any OpenAI-compatible endpoint works.
 | `CODEX_RELAY_SESSION_TTL_HOURS` | `168` | Retain idle session/reasoning state for this many hours |
 | `CODEX_RELAY_MAX_SESSIONS` | `256` | Maximum completed response histories retained for `previous_response_id` |
 | `CODEX_RELAY_MAX_SESSION_MEMORY_MB` | `512` | Approximate memory budget for retained session/reasoning state |
+| `CODEX_RELAY_HISTORY_STORE` | `memory` | Retained history backend: `memory` or `disk` |
+| `CODEX_RELAY_HISTORY_DIR` | `.codex-relay-history` | Directory for disk-backed history records |
 | `RUST_LOG` | `codex_relay=info` | Log verbosity |
 
 ## Python API
@@ -158,6 +160,36 @@ These lines are useful for checking whether a tool such as `spawn_agent`
 was preserved by the relay, and whether the failure happened before or after
 the model selected that tool.
 
+### Disk-backed history
+
+By default, `codex-relay` keeps retained `previous_response_id` histories and
+reasoning lookups in memory. For longer-running processes or deeper debugging,
+you can opt into an inspectable on-disk store:
+
+```bash
+CODEX_RELAY_HISTORY_STORE=disk \
+CODEX_RELAY_HISTORY_DIR=.codex-relay-history \
+codex-relay
+```
+
+The disk backend writes JSON records under:
+
+```text
+.codex-relay-history/
+  sessions/
+  reasoning/
+  turns/
+```
+
+Session records contain the translated Chat Completions `messages` retained for
+a response id. Reasoning records keep call-id and turn-fingerprint lookups used
+to round-trip provider reasoning content. The relay keeps only an in-memory
+index for disk-backed entries and loads payloads on demand.
+
+Treat this directory as sensitive: records may contain prompts, tool outputs,
+and other conversation data. The same TTL/count/byte retention knobs apply to
+disk-backed records, and evicted entries are removed from disk.
+
 ### Subagent tool routing
 
 Codex subagent tools such as `spawn_agent`, `wait_agent`, and `close_agent`
@@ -180,7 +212,7 @@ CODEX_RELAY_TOOL_DENYLIST=spawn_agent,wait_agent,close_agent codex-relay
 
 The denylist matches the tool name forwarded to Chat Completions. Namespaced
 MCP tools use their flattened name, for example
-`mcp__codex_apps__github_fetch_issue`.
+`mcp__codex_apps__github-_fetch_issue`.
 
 **Offline (always green, default `cargo test`)**
 
@@ -223,7 +255,11 @@ This project is **not affiliated with, endorsed by, or sponsored by OpenAI**. "C
 ## Contributors
 
 - [myk5010](https://github.com/myk5010) — system/developer message ordering fix and model name mapping ([\#4](https://github.com/MetaFARS/codex-relay/pull/4))
-- [qcnhy](https://github.com/qcnhy) — streaming usage and MCP namespace bug reports plus independent verification ([\#5](https://github.com/MetaFARS/codex-relay/issues/5), [\#6](https://github.com/MetaFARS/codex-relay/issues/6))
+- [qcnhy](https://github.com/qcnhy) — streaming usage, MCP namespace bug reports, namespace tool-routing analysis, and independent verification ([\#5](https://github.com/MetaFARS/codex-relay/issues/5), [\#6](https://github.com/MetaFARS/codex-relay/issues/6), [\#17](https://github.com/MetaFARS/codex-relay/issues/17))
+- [JasonC93](https://github.com/JasonC93) — subagent tool-routing and spawned-agent context isolation reports ([\#10](https://github.com/MetaFARS/codex-relay/issues/10), [\#12](https://github.com/MetaFARS/codex-relay/issues/12))
+- [ma-buting](https://github.com/ma-buting) — namespace tool-name separator fix ([\#19](https://github.com/MetaFARS/codex-relay/pull/19))
+- [SaladDay](https://github.com/SaladDay) — prompt-cache accounting debug logs ([\#22](https://github.com/MetaFARS/codex-relay/pull/22))
+- [Cherno76](https://github.com/Cherno76) — prompt-cache hit tokens in Responses API usage ([\#23](https://github.com/MetaFARS/codex-relay/pull/23))
 
 ## License
 

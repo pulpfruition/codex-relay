@@ -14,7 +14,7 @@ use axum::{
 use clap::Parser;
 use reqwest::{Client, Url};
 use session::{SessionStore, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_BYTES, DEFAULT_SESSION_TTL};
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 use types::*;
 
@@ -70,6 +70,18 @@ struct Args {
         default_value_t = DEFAULT_SESSION_TTL.as_secs() / 60 / 60
     )]
     session_ttl_hours: u64,
+
+    /// History retention backend: memory or disk.
+    #[arg(long, env = "CODEX_RELAY_HISTORY_STORE", default_value = "memory")]
+    history_store: String,
+
+    /// Directory used when CODEX_RELAY_HISTORY_STORE=disk.
+    #[arg(
+        long,
+        env = "CODEX_RELAY_HISTORY_DIR",
+        default_value = ".codex-relay-history"
+    )]
+    history_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -118,19 +130,31 @@ async fn main() -> Result<()> {
         .saturating_mul(1024)
         .saturating_mul(1024);
     let session_ttl = Duration::from_secs(args.session_ttl_hours.saturating_mul(60 * 60));
-    let state = AppState {
-        sessions: SessionStore::with_limits_and_ttl(
+    let sessions = match args.history_store.as_str() {
+        "memory" => {
+            SessionStore::with_limits_and_ttl(args.max_sessions, max_session_bytes, session_ttl)
+        }
+        "disk" => SessionStore::with_disk_limits_and_ttl(
+            &args.history_dir,
             args.max_sessions,
             max_session_bytes,
             session_ttl,
-        ),
+        )?,
+        other => bail!("history store must be 'memory' or 'disk', got: {other}"),
+    };
+    let state = AppState {
+        sessions,
         client: client.clone(),
         upstream: Arc::new(upstream.clone()),
         api_key: api_key.clone(),
     };
     info!(
-        "session retention: ttl={}h max_sessions={} max_session_memory={} MiB",
-        args.session_ttl_hours, args.max_sessions, args.max_session_memory_mb
+        "session retention: store={} dir={} ttl={}h max_sessions={} max_session_memory={} MiB",
+        args.history_store,
+        args.history_dir.display(),
+        args.session_ttl_hours,
+        args.max_sessions,
+        args.max_session_memory_mb
     );
 
     // Fetch upstream model list asynchronously for user visibility
@@ -279,10 +303,7 @@ async fn print_codex_config(client: &Client, upstream: &Url, api_key: &str, prov
     println!("wire_api = \"responses\"");
     println!(
         "env_key = \"{}_API_KEY\"",
-        provider_name
-            .to_uppercase()
-            .replace('-', "_")
-            .replace('.', "_")
+        provider_name.to_uppercase().replace(['-', '.'], "_")
     );
     println!();
 
@@ -338,11 +359,12 @@ fn estimate_model_properties(model_id: &str) -> ModelProps {
         (262_144, 1_048_576)
     } else if lower.contains("qwen") {
         (131_072, 131_072)
-    } else if lower.contains("kimi") || lower.contains("moonshot") {
-        (128_000, 128_000)
-    } else if lower.contains("mistral") {
-        (128_000, 128_000)
-    } else if lower.contains("llama") || lower.contains("codestral") {
+    } else if lower.contains("kimi")
+        || lower.contains("moonshot")
+        || lower.contains("mistral")
+        || lower.contains("llama")
+        || lower.contains("codestral")
+    {
         (128_000, 128_000)
     } else {
         // Conservative default for unknown models
@@ -455,7 +477,11 @@ fn response_tool_debug_names(tools: &[serde_json::Value]) -> Vec<String> {
                         if sub.get("type").and_then(serde_json::Value::as_str) == Some("function") {
                             if let Some(name) = sub.get("name").and_then(serde_json::Value::as_str)
                             {
-                                names.push(format!("{namespace}{name}"));
+                                names.push(
+                                    crate::translate::chat_function_name_for_namespace_tool(
+                                        namespace, name,
+                                    ),
+                                );
                             }
                         }
                     }
@@ -497,7 +523,21 @@ fn chat_response_tool_call_debug_names(chat_resp: &ChatResponse) -> Vec<String> 
         .collect()
 }
 
-async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+async fn handle_responses(State(state): State<AppState>, req: Request) -> Response {
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("body read error: {e}");
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
+
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -525,23 +565,40 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
         summarize_debug_names(response_tool_debug_names(&req.tools))
     );
 
-    handle_responses_inner(state, req).await
+    handle_responses_inner(state, req, auth_header).await
 }
 
-async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Response {
-    let history = req
+async fn handle_responses_inner(
+    state: AppState,
+    req: ResponsesRequest,
+    auth_header: Option<String>,
+) -> Response {
+    let mut history = req
         .previous_response_id
         .as_deref()
         .map(|id| state.sessions.get_history(id))
         .unwrap_or_default();
+    if should_isolate_spawn_child_request(&req, &history) {
+        debug!("isolating spawned child request from parent response history");
+        history.clear();
+    }
 
     let model = req.model.clone();
-    let mut chat_req = translate::to_chat_request(&req, history.clone(), &state.sessions);
+    let namespace_tools = translate::namespace_tool_map(&req.tools);
+    let mut chat_req = translate::to_chat_request(&req, history, &state.sessions);
     debug!(
         "→ upstream tools={}",
         summarize_debug_names(chat_tool_debug_names(&chat_req.tools))
     );
     let url = format!("{}chat/completions", join_base(&state.upstream));
+
+    let effective_auth = auth_header.or_else(|| {
+        if !state.api_key.is_empty() {
+            Some(format!("Bearer {}", state.api_key))
+        } else {
+            None
+        }
+    });
 
     if req.stream {
         let response_id = state.sessions.new_id();
@@ -550,18 +607,80 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
         stream::translate_stream(stream::StreamArgs {
             client: state.client,
             url,
-            api_key: state.api_key,
+            auth_header: effective_auth,
             chat_req,
             response_id,
             sessions: state.sessions,
             request_messages,
+            namespace_tools,
             model,
         })
         .into_response()
     } else {
         chat_req.stream = false;
-        handle_blocking(state, chat_req, url, model).await
+        handle_blocking(state, chat_req, url, model, namespace_tools, effective_auth).await
     }
+}
+
+fn should_isolate_spawn_child_request(req: &ResponsesRequest, history: &[ChatMessage]) -> bool {
+    let Some(input_text) = isolated_user_text(&req.input) else {
+        return false;
+    };
+    let completed_tool_calls: std::collections::HashSet<&str> = history
+        .iter()
+        .filter_map(|msg| msg.tool_call_id.as_deref())
+        .collect();
+    history.iter().any(|msg| {
+        msg.tool_calls.as_deref().unwrap_or(&[]).iter().any(|call| {
+            let call_id = call.get("id").and_then(serde_json::Value::as_str);
+            call_id.is_none_or(|id| !completed_tool_calls.contains(id))
+                && spawn_agent_message(call).is_some_and(|message| message == input_text)
+        })
+    })
+}
+
+fn isolated_user_text(input: &ResponsesInput) -> Option<&str> {
+    match input {
+        ResponsesInput::Text(text) => Some(text.as_str()),
+        ResponsesInput::Messages(items) => {
+            if items.len() != 1 {
+                return None;
+            }
+            let item = &items[0];
+            if item.get("type").and_then(serde_json::Value::as_str) != Some("message")
+                || item.get("role").and_then(serde_json::Value::as_str) != Some("user")
+            {
+                return None;
+            }
+            match item.get("content") {
+                Some(serde_json::Value::String(text)) => Some(text.as_str()),
+                Some(serde_json::Value::Array(parts)) if parts.len() == 1 => {
+                    parts[0].get("text").and_then(serde_json::Value::as_str)
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+fn spawn_agent_message(call: &serde_json::Value) -> Option<String> {
+    if call
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(serde_json::Value::as_str)
+        != Some("spawn_agent")
+    {
+        return None;
+    }
+    let arguments = call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .and_then(serde_json::Value::as_str)?;
+    let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    arguments
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
 }
 
 async fn handle_blocking(
@@ -569,14 +688,16 @@ async fn handle_blocking(
     chat_req: types::ChatRequest,
     url: String,
     model: String,
+    namespace_tools: translate::NamespaceToolMap,
+    auth_header: Option<String>,
 ) -> Response {
     let mut builder = state
         .client
         .post(&url)
         .header("Content-Type", "application/json");
 
-    if !state.api_key.is_empty() {
-        builder = builder.bearer_auth(state.api_key.as_str());
+    if let Some(auth) = auth_header {
+        builder = builder.header("Authorization", auth);
     }
 
     match builder.json(&chat_req).send().await {
@@ -621,7 +742,16 @@ async fn handle_blocking(
                 full_history.push(assistant_msg);
                 let response_id = state.sessions.save(full_history);
 
-                let (resp, _) = translate::from_chat_response(response_id, &model, chat_resp);
+                let (resp, _) = if namespace_tools.is_empty() {
+                    translate::from_chat_response(response_id, &model, chat_resp)
+                } else {
+                    translate::from_chat_response_with_tool_map(
+                        response_id,
+                        &model,
+                        chat_resp,
+                        &namespace_tools,
+                    )
+                };
                 Json(resp).into_response()
             }
         },
@@ -699,7 +829,7 @@ mod tests {
             response_tool_debug_names(&tools),
             vec![
                 "spawn_agent".to_string(),
-                "mcp__codex_apps__github_fetch_issue".to_string(),
+                "mcp__codex_apps__github-_fetch_issue".to_string(),
                 "<web_search>".to_string(),
             ]
         );
@@ -732,6 +862,119 @@ mod tests {
             chat_response_tool_call_debug_names(&chat_resp),
             vec!["spawn_agent".to_string()]
         );
+    }
+
+    #[test]
+    fn test_spawn_child_request_isolated_when_input_matches_spawn_message() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Text("child task".into()),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            tool_choice: None,
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "arguments": "{\"task_name\":\"child\",\"message\":\"child task\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_spawn_child_isolation_does_not_match_tool_outputs() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Messages(vec![json!({
+                "type": "function_call_output",
+                "call_id": "call_spawn",
+                "output": "child result"
+            })]),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            tool_choice: None,
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "arguments": "{\"task_name\":\"child\",\"message\":\"child task\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(!should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_spawn_child_isolation_ignores_completed_spawn_calls() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Text("child task".into()),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            tool_choice: None,
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+        };
+        let history = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![json!({
+                    "id": "call_spawn",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"task_name\":\"child\",\"message\":\"child task\"}"
+                    }
+                })]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(serde_json::Value::String("4".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("call_spawn".into()),
+                name: None,
+            },
+        ];
+
+        assert!(!should_isolate_spawn_child_request(&req, &history));
     }
 
     #[test]
