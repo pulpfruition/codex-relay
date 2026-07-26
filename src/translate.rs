@@ -227,9 +227,7 @@ fn convert_tool_choice(
     choice: Option<&Value>,
     namespace_tools: &NamespaceToolMap,
 ) -> Option<Value> {
-    let Some(choice) = choice else {
-        return None;
-    };
+    let choice = choice?;
 
     let Value::Object(obj) = choice else {
         return Some(choice.clone());

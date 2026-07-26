@@ -35,14 +35,6 @@ pub enum ResponsesInput {
     Messages(Vec<Value>),
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
-pub struct ContentPart {
-    #[serde(rename = "type")]
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct ResponsesResponse {
     pub id: String,
