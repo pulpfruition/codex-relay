@@ -694,7 +694,8 @@ async fn handle_blocking(
     let mut builder = state
         .client
         .post(&url)
-        .header("Content-Type", "application/json");
+        .header("Content-Type", "application/json")
+        .header("x-bf-passthrough-extra-params", "true");
 
     if let Some(auth) = auth_header {
         builder = builder.header("Authorization", auth);
@@ -875,6 +876,7 @@ mod tests {
             stream: false,
             temperature: None,
             max_output_tokens: None,
+            reasoning: None,
             system: None,
             instructions: None,
         };
@@ -912,6 +914,7 @@ mod tests {
             stream: false,
             temperature: None,
             max_output_tokens: None,
+            reasoning: None,
             system: None,
             instructions: None,
         };
@@ -945,6 +948,7 @@ mod tests {
             stream: false,
             temperature: None,
             max_output_tokens: None,
+            reasoning: None,
             system: None,
             instructions: None,
         };

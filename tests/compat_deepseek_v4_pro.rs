@@ -21,6 +21,7 @@ fn base_req(input: ResponsesInput) -> ResponsesRequest {
         stream: false,
         temperature: None,
         max_output_tokens: None,
+        reasoning: None,
         system: None,
         instructions: None,
     }

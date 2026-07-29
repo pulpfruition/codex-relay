@@ -128,7 +128,10 @@ pub fn translate_stream(
                 "response": { "id": &response_id, "status": "in_progress", "model": &model }
             }).to_string()));
 
-        let mut builder = client.post(&url).header("Content-Type", "application/json");
+        let mut builder = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("x-bf-passthrough-extra-params", "true");
         if let Some(auth) = auth_header {
             builder = builder.header("Authorization", auth);
         }
