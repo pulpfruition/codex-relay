@@ -188,6 +188,11 @@ async fn models_handler() -> axum::Json<Value> {
 }
 
 async fn chat_handler(State(state): State<MockState>, req: axum::extract::Request) -> Response {
+    let passthrough_header = req
+        .headers()
+        .get("x-bf-passthrough-extra-params")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let bytes = match axum::body::to_bytes(req.into_body(), 1_000_000).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -197,7 +202,8 @@ async fn chat_handler(State(state): State<MockState>, req: axum::extract::Reques
                 .unwrap();
         }
     };
-    let body: Value = serde_json::from_slice(&bytes).expect("chat request json");
+    let mut body: Value = serde_json::from_slice(&bytes).expect("chat request json");
+    body["__test_passthrough_header"] = json!(passthrough_header);
     state.bodies.lock().unwrap().push(body);
 
     let sse = state
@@ -678,4 +684,27 @@ async fn issue_12_spawn_agent_child_context_should_not_replay_parent_history() {
         vec![child_task],
         "child upstream request should contain exactly the spawned message as user input"
     );
+}
+
+#[tokio::test]
+async fn reasoning_effort_reaches_upstream_with_bifrost_passthrough_header() {
+    let (upstream_port, bodies) = spawn_mock_upstream().await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let _completed = post_stream_completed(
+        &relay,
+        json!({
+            "model": "pulp/think",
+            "input": "Synthesize this.",
+            "reasoning": {"effort": "high"},
+            "stream": true
+        }),
+    )
+    .await;
+
+    let requests = bodies.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["thinking"]["type"], "enabled");
+    assert_eq!(requests[0]["reasoning_effort"], "high");
+    assert_eq!(requests[0]["__test_passthrough_header"], "true");
 }

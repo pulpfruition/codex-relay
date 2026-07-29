@@ -204,8 +204,17 @@ pub fn to_chat_request(
         }
     }
 
+    let mapped_model = map_model_name(&req.model);
+    let requested_effort = req
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_deref());
+    let effective_effort = requested_effort.or_else(|| logical_reasoning_default(&req.model));
+    let (thinking, reasoning_effort) =
+        reasoning_controls(&req.model, &mapped_model, effective_effort);
+
     ChatRequest {
-        model: map_model_name(&req.model),
+        model: mapped_model,
         messages,
         tools: convert_tools(&req.tools),
         tool_choice: convert_tool_choice(req.tool_choice.as_ref(), &namespace_tool_map(&req.tools)),
@@ -214,8 +223,59 @@ pub fn to_chat_request(
         stream_options: req.stream.then_some(ChatStreamOptions {
             include_usage: true,
         }),
+        reasoning_effort,
+        thinking,
         stream: req.stream,
     }
+}
+
+fn logical_reasoning_default(model: &str) -> Option<&'static str> {
+    match model {
+        "pulp/instant" => Some("none"),
+        "pulp/brain" | "pulp/think" | "pulp/dream" => Some("high"),
+        _ => None,
+    }
+}
+
+fn is_deepseek_policy_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("deepseek")
+        || matches!(
+            model.as_str(),
+            "pulp/instant" | "pulp/brain" | "pulp/think" | "pulp/dream"
+        )
+}
+
+fn reasoning_controls(
+    requested_model: &str,
+    mapped_model: &str,
+    effort: Option<&str>,
+) -> (Option<ChatThinking>, Option<String>) {
+    let Some(effort) = effort else {
+        return (None, None);
+    };
+    if !is_deepseek_policy_model(requested_model) && !is_deepseek_policy_model(mapped_model) {
+        return (None, Some(effort.to_string()));
+    }
+    if effort.eq_ignore_ascii_case("none") {
+        return (
+            Some(ChatThinking {
+                kind: "disabled".into(),
+            }),
+            None,
+        );
+    }
+    let normalized = if effort.eq_ignore_ascii_case("max") || effort.eq_ignore_ascii_case("xhigh") {
+        "max"
+    } else {
+        "high"
+    };
+    (
+        Some(ChatThinking {
+            kind: "enabled".into(),
+        }),
+        Some(normalized.to_string()),
+    )
 }
 
 /// Convert Responses API tool selection into Chat Completions shape.
@@ -654,6 +714,7 @@ mod tests {
             stream: false,
             temperature: None,
             max_output_tokens: None,
+            reasoning: None,
             system: None,
             instructions: None,
         }
@@ -667,6 +728,67 @@ mod tests {
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, "user");
         assert_eq!(chat.messages[0].text_content(), "hello");
+    }
+
+    #[test]
+    fn test_pulp_instant_defaults_to_disabled_thinking() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.model = "pulp/instant".into();
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(
+            chat.thinking,
+            Some(ChatThinking {
+                kind: "disabled".into()
+            })
+        );
+        assert_eq!(chat.reasoning_effort, None);
+    }
+
+    #[test]
+    fn test_pulp_think_defaults_to_high_not_auto_max() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.model = "pulp/think".into();
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(
+            chat.thinking,
+            Some(ChatThinking {
+                kind: "enabled".into()
+            })
+        );
+        assert_eq!(chat.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_pulp_think_preserves_max_effort() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.model = "pulp/think".into();
+        req.reasoning = Some(ResponsesReasoning {
+            effort: Some("max".into()),
+        });
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(
+            chat.thinking,
+            Some(ChatThinking {
+                kind: "enabled".into()
+            })
+        );
+        assert_eq!(chat.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn test_non_deepseek_effort_does_not_invent_thinking_switch() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.model = "mock-model".into();
+        req.reasoning = Some(ResponsesReasoning {
+            effort: Some("low".into()),
+        });
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.thinking, None);
+        assert_eq!(chat.reasoning_effort.as_deref(), Some("low"));
     }
 
     #[test]

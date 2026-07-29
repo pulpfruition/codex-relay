@@ -19,11 +19,19 @@ pub struct ResponsesRequest {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub reasoning: Option<ResponsesReasoning>,
     /// Responses API system prompt field (some clients use `system`, others `instructions`)
     #[serde(default)]
     pub system: Option<String>,
     #[serde(default)]
     pub instructions: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ResponsesReasoning {
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,12 +82,22 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<ChatStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ChatThinking>,
     pub stream: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ChatStreamOptions {
     pub include_usage: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ChatThinking {
+    #[serde(rename = "type")]
+    pub kind: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -214,6 +214,25 @@ The denylist matches the tool name forwarded to Chat Completions. Namespaced
 MCP tools use their flattened name, for example
 `mcp__codex_apps__github-_fetch_issue`.
 
+### Reasoning policy forwarding
+
+The relay preserves the Responses API `reasoning.effort` selection when it
+translates a request to Chat Completions. DeepSeek-compatible lanes receive the
+provider-native wire controls:
+
+- `none` becomes `thinking: {"type":"disabled"}`
+- `high` becomes enabled thinking with `reasoning_effort: "high"`
+- `max` and `xhigh` become enabled thinking with `reasoning_effort: "max"`
+
+Pulp logical policy models have defensive defaults when the caller omits the
+field: `pulp/instant` disables thinking, while `pulp/brain`, `pulp/think`, and
+`pulp/dream` use `high`. Raw DeepSeek models retain provider auto-selection
+unless the caller explicitly selects an effort.
+
+The relay sets `x-bf-passthrough-extra-params: true` on upstream requests so
+Bifrost forwards the provider-native `thinking` object instead of discarding it.
+This header is harmless for a direct provider endpoint.
+
 **Offline (always green, default `cargo test`)**
 
 Replays Codex CLI fixtures through the translation layer and asserts
