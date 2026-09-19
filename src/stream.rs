@@ -28,7 +28,7 @@ use crate::{
 pub struct StreamArgs {
     pub client: reqwest::Client,
     pub url: String,
-    pub api_key: Arc<String>,
+    pub authorization: Option<String>,
     pub chat_req: ChatRequest,
     pub upstream_request: Arc<UpstreamRequestConfig>,
     pub response_id: String,
@@ -77,7 +77,7 @@ pub fn translate_stream(
     let StreamArgs {
         client,
         url,
-        api_key,
+        authorization,
         chat_req,
         upstream_request,
         response_id,
@@ -101,8 +101,8 @@ pub fn translate_stream(
             }).to_string()));
 
         let mut builder = client.post(&url).header("Content-Type", "application/json");
-        if !api_key.is_empty() {
-            builder = builder.bearer_auth(api_key.as_str());
+        if let Some(authorization) = authorization.as_deref() {
+            builder = builder.header("Authorization", authorization);
         }
 
         let upstream_body = match upstream_request.request_body(&chat_req) {

@@ -11,7 +11,7 @@ mod upstream_request;
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -70,6 +70,18 @@ struct Args {
     /// Bundled Codex model whose tool protocol and instructions custom models inherit.
     #[arg(long, requires = "model_catalog", value_name = "MODEL")]
     model_template: Option<String>,
+
+    /// Maximum time to establish an upstream connection.
+    #[arg(
+        long,
+        env = "CODEX_RELAY_CONNECT_TIMEOUT_SECONDS",
+        default_value_t = 10
+    )]
+    connect_timeout_seconds: u64,
+
+    /// Maximum silence between upstream response bytes.
+    #[arg(long, env = "CODEX_RELAY_READ_TIMEOUT_SECONDS", default_value_t = 45)]
+    read_timeout_seconds: u64,
 
     /// Maximum completed response histories retained for previous_response_id.
     #[arg(
@@ -142,7 +154,10 @@ async fn main() -> Result<()> {
         args.drop_upstream_params.as_deref(),
     )?);
 
-    let client = Client::new();
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(args.connect_timeout_seconds))
+        .read_timeout(Duration::from_secs(args.read_timeout_seconds))
+        .build()?;
     let api_key = Arc::new(args.api_key);
 
     // --print-config: fetch models and print Codex config snippet, then exit.
@@ -755,7 +770,20 @@ fn chat_response_tool_call_debug_names(chat_resp: &ChatResponse) -> Vec<String> 
         .collect()
 }
 
-async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+fn request_authorization(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+async fn handle_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let authorization = request_authorization(&headers);
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -785,10 +813,14 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
         summarize_debug_names(response_tool_debug_names(&req.tools))
     );
 
-    handle_responses_inner(state, req).await
+    handle_responses_inner(state, req, authorization).await
 }
 
-async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> Response {
+async fn handle_responses_inner(
+    state: AppState,
+    mut req: ResponsesRequest,
+    authorization: Option<String>,
+) -> Response {
     if let Err(message) = translate::validate_unique_chat_tool_names(&req.tools) {
         return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
     }
@@ -823,7 +855,7 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
         stream::translate_stream(stream::StreamArgs {
             client: state.client,
             url,
-            api_key: state.api_key,
+            authorization: authorization.clone(),
             chat_req,
             upstream_request: state.upstream_request,
             response_id,
@@ -846,6 +878,7 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
             namespace_tools,
             custom_tools,
             previous_response_id,
+            authorization,
         )
         .await
     }
@@ -1150,14 +1183,15 @@ async fn handle_blocking(
     namespace_tools: translate::NamespaceToolMap,
     custom_tools: translate::CustomToolMap,
     previous_response_id: Option<String>,
+    authorization: Option<String>,
 ) -> Response {
     let mut builder = state
         .client
         .post(&url)
         .header("Content-Type", "application/json");
 
-    if !state.api_key.is_empty() {
-        builder = builder.bearer_auth(state.api_key.as_str());
+    if let Some(authorization) = authorization {
+        builder = builder.header("Authorization", authorization);
     }
 
     let upstream_body = match state.upstream_request.request_body(&chat_req) {
@@ -1284,6 +1318,18 @@ async fn handle_blocking(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_request_authorization_reads_only_incoming_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer request-scoped".parse().unwrap());
+
+        assert_eq!(
+            request_authorization(&headers),
+            Some("Bearer request-scoped".to_string())
+        );
+        assert_eq!(request_authorization(&HeaderMap::new()), None);
+    }
 
     #[test]
     fn test_validate_upstream_https() {
