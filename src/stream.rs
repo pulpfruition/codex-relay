@@ -21,7 +21,7 @@ use crate::{
         response_function_name_for_responses, uses_plaintext_collaboration_args,
         validate_tool_call_entries, CustomToolMap, NamespaceToolMap,
     },
-    types::{ChatMessage, ChatRequest, ChatStreamChunk, ChatUsage},
+    types::{ChatMessage, ChatRequest, ChatStreamChoice, ChatStreamChunk, ChatUsage},
     upstream_request::UpstreamRequestConfig,
 };
 
@@ -48,6 +48,35 @@ struct ToolCallAccum {
     id: String,
     name: String,
     arguments: String,
+}
+
+fn is_inert_terminal_usage_choice(choice: &ChatStreamChoice) -> bool {
+    choice.finish_reason.is_none()
+        && choice.delta.role.is_none()
+        && choice
+            .delta
+            .content
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+        && choice
+            .delta
+            .reasoning_content
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+        && choice
+            .delta
+            .reasoning
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+        && choice
+            .delta
+            .tool_calls
+            .as_ref()
+            .map(Vec::is_empty)
+            .unwrap_or(true)
 }
 
 fn summarize_stream_tool_call_names(tool_calls: &BTreeMap<usize, ToolCallAccum>) -> String {
@@ -218,11 +247,17 @@ pub fn translate_stream(
                         }
                         Ok(chunk) => {
                             let ChatStreamChunk { choices, usage } = chunk;
-                            if usage.is_some() {
+                            let has_usage = usage.is_some();
+                            if has_usage {
                                 stream_usage = usage;
                             }
+                            let terminal_usage_envelope = terminal_choice_seen
+                                && has_usage
+                                && choices.len() == 1
+                                && choices[0].index == 0
+                                && is_inert_terminal_usage_choice(&choices[0]);
                             if !choices.is_empty()
-                                && (terminal_choice_seen
+                                && ((terminal_choice_seen && !terminal_usage_envelope)
                                     || choices.len() != 1
                                     || choices[0].index != 0)
                             {

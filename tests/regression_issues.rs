@@ -1079,6 +1079,43 @@ async fn issue_31_stream_without_done_still_completes_when_content_received() {
 }
 
 #[tokio::test]
+async fn issue_160_bifrost_terminal_usage_envelope_is_allowed() {
+    // Bifrost forwards a finish_reason carried on a content chunk, then emits
+    // one synthetic chat.completion.chunk with an empty index-0 delta and the
+    // accumulated usage. That tail is bookkeeping, not post-terminal choice data.
+    let sse = sse_from_chunks(vec![
+        json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"PONG"}}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        json!({
+            "choices":[{"index":0,"delta":{},"finish_reason":null}],
+            "usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}
+        }),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "Say PONG.", "tools": [], "stream": true}),
+    )
+    .await;
+
+    assert!(
+        events.iter().all(|(event, _)| event != "response.failed"),
+        "Bifrost terminal usage envelope must not fail the Responses stream: {events:?}"
+    );
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    assert_eq!(
+        completed["response"]["output"][0]["content"][0]["text"],
+        "PONG"
+    );
+    assert_eq!(completed["response"]["usage"]["total_tokens"], 6);
+}
+
+#[tokio::test]
 async fn issue_31_unterminated_done_line_is_still_recognized() {
     // synthetic.new ends the stream with `data: [DONE]` and no trailing
     // newline. The SSE spec discards an unterminated final event at EOF, so
