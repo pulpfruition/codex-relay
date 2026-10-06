@@ -1,36 +1,45 @@
+mod corpus;
+mod dsml;
+mod quirks;
 mod session;
 mod stream;
+mod think;
 mod translate;
 mod types;
+mod upstream_request;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use clap::Parser;
+use corpus::CorpusRecorder;
 use reqwest::{Client, Url};
 use session::{SessionStore, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_BYTES, DEFAULT_SESSION_TTL};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{fs, path::PathBuf, process::Command, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 use types::*;
+use upstream_request::UpstreamRequestConfig;
 
 const DEBUG_NAME_LIMIT: usize = 80;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "codex-relay",
-    about = "Responses API ↔ Chat Completions bridge"
+    about = "Responses API ↔ Chat Completions bridge",
+    version = env!("CARGO_PKG_VERSION")
 )]
 struct Args {
     #[arg(long, env = "CODEX_RELAY_PORT", default_value = "4444")]
     port: u16,
 
-    #[arg(long, env = "CODEX_RELAY_HOST", default_value = "0.0.0.0")]
-    host: String,
+    /// IP address to bind the listener to (e.g. 0.0.0.0 to accept remote connections).
+    #[arg(long, env = "CODEX_RELAY_BIND", default_value = "127.0.0.1")]
+    bind: std::net::IpAddr,
 
     #[arg(
         long,
@@ -42,10 +51,37 @@ struct Args {
     #[arg(long, env = "CODEX_RELAY_API_KEY", default_value = "")]
     api_key: String,
 
-    /// Print a ready-to-use Codex config.toml snippet (including model_properties)
-    /// for all models exposed by the upstream provider.
+    /// JSON object merged into every upstream Chat Completions request body.
+    #[arg(long, env = "CODEX_RELAY_UPSTREAM_EXTRA_PARAMS")]
+    upstream_extra_params: Option<String>,
+
+    /// JSON array of top-level upstream request parameter names to remove.
+    #[arg(long, env = "CODEX_RELAY_DROP_PARAMS")]
+    drop_upstream_params: Option<String>,
+
+    /// Print a ready-to-use Codex config.toml snippet.
     #[arg(long)]
     print_config: bool,
+
+    /// Write a version-matched Codex model catalog and reference it from --print-config.
+    #[arg(long, requires = "print_config", value_name = "PATH")]
+    model_catalog: Option<PathBuf>,
+
+    /// Bundled Codex model whose tool protocol and instructions custom models inherit.
+    #[arg(long, requires = "model_catalog", value_name = "MODEL")]
+    model_template: Option<String>,
+
+    /// Maximum time to establish an upstream connection.
+    #[arg(
+        long,
+        env = "CODEX_RELAY_CONNECT_TIMEOUT_SECONDS",
+        default_value_t = 10
+    )]
+    connect_timeout_seconds: u64,
+
+    /// Maximum silence between upstream response bytes.
+    #[arg(long, env = "CODEX_RELAY_READ_TIMEOUT_SECONDS", default_value_t = 45)]
+    read_timeout_seconds: u64,
 
     /// Maximum completed response histories retained for previous_response_id.
     #[arg(
@@ -82,6 +118,13 @@ struct Args {
         default_value = ".codex-relay-history"
     )]
     history_dir: PathBuf,
+
+    /// Append the conversation flow of every completed turn to daily-sharded
+    /// JSONL files (OpenAI messages format) in this directory. Off by default.
+    /// Records contain prompts, tool call arguments, and tool outputs — treat
+    /// the directory as sensitive.
+    #[arg(long, env = "CODEX_RELAY_RECORD_CORPUS")]
+    record_corpus: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -90,6 +133,8 @@ struct AppState {
     client: Client,
     upstream: Arc<Url>,
     api_key: Arc<String>,
+    upstream_request: Arc<UpstreamRequestConfig>,
+    corpus: Option<CorpusRecorder>,
 }
 
 #[tokio::main]
@@ -104,8 +149,15 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let upstream = validate_upstream(&args.upstream)?;
+    let upstream_request = Arc::new(UpstreamRequestConfig::from_raw(
+        args.upstream_extra_params.as_deref(),
+        args.drop_upstream_params.as_deref(),
+    )?);
 
-    let client = Client::new();
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(args.connect_timeout_seconds))
+        .read_timeout(Duration::from_secs(args.read_timeout_seconds))
+        .build()?;
     let api_key = Arc::new(args.api_key);
 
     // --print-config: fetch models and print Codex config snippet, then exit.
@@ -121,7 +173,15 @@ async fn main() -> Result<()> {
                     .trim_end_matches(".io")
             })
             .unwrap_or("custom");
-        print_codex_config(&client, &upstream, &api_key, provider_name).await;
+        print_codex_config(
+            &client,
+            &upstream,
+            &api_key,
+            provider_name,
+            args.model_catalog.as_deref(),
+            args.model_template.as_deref(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -142,11 +202,24 @@ async fn main() -> Result<()> {
         )?,
         other => bail!("history store must be 'memory' or 'disk', got: {other}"),
     };
+    let corpus = match &args.record_corpus {
+        Some(dir) => {
+            let recorder = CorpusRecorder::new(dir)?;
+            warn!(
+                "corpus recording ENABLED → {} (records prompts, tool arguments, and tool outputs; treat as sensitive)",
+                dir.display()
+            );
+            Some(recorder)
+        }
+        None => None,
+    };
     let state = AppState {
         sessions,
         client: client.clone(),
         upstream: Arc::new(upstream.clone()),
         api_key: api_key.clone(),
+        upstream_request: upstream_request.clone(),
+        corpus,
     };
     info!(
         "session retention: store={} dir={} ttl={}h max_sessions={} max_session_memory={} MiB",
@@ -156,6 +229,13 @@ async fn main() -> Result<()> {
         args.max_sessions,
         args.max_session_memory_mb
     );
+    if !upstream_request.is_empty() {
+        info!(
+            "upstream request params: extra={} drop={}",
+            upstream_request.extra_param_count(),
+            upstream_request.drop_param_count()
+        );
+    }
 
     // Fetch upstream model list asynchronously for user visibility
     tokio::spawn(log_upstream_models(client, Arc::new(upstream), api_key));
@@ -165,7 +245,8 @@ async fn main() -> Result<()> {
     // Disable axum's default 2 MiB body cap: Codex CLI may send base64-encoded
     // image attachments that easily exceed it, and a framework-level 413 looks
     // like a transport-layer death to Codex and crashes the session (#2).
-
+    // The relay binds 127.0.0.1 by default; --bind can expose it more widely,
+    // so be mindful of DoS when binding to a non-loopback address.
     let app = Router::new()
         .route("/v1/responses", post(handle_responses))
         .route("/v1/models", get(handle_models))
@@ -173,13 +254,15 @@ async fn main() -> Result<()> {
         .layer(DefaultBodyLimit::disable())
         .with_state(state.clone());
 
-    let addr = format!("{}:{}", args.host, args.port);
+    let addr = std::net::SocketAddr::new(args.bind, args.port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Log the actual bound address so that `--port 0` (ephemeral port) reports
+    // the real port instead of `:0`.
     info!(
-        "codex-relay listening on {addr} → {}",
+        "codex-relay listening on {} → {}",
+        listener.local_addr()?,
         state.upstream.as_ref()
     );
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -225,7 +308,7 @@ async fn log_upstream_models(client: Client, upstream: Arc<Url>, api_key: Arc<St
                 if !models.is_empty() {
                     info!("upstream models: {}", models.join(", "));
                     info!(
-                        "⚠️  To configure Codex with model metadata, run:  codex-relay --print-config --upstream {} {}",
+                        "⚠️  To configure Codex with model metadata, run:  codex-relay --print-config --model-catalog ~/.codex/codex-relay-models.json --upstream {} {}",
                         upstream.as_str(),
                         if api_key.is_empty() { "" } else { "--api-key ..." }
                     );
@@ -249,9 +332,16 @@ async fn cleanup_sessions(sessions: SessionStore) {
     }
 }
 
-/// Print a Codex config.toml snippet that includes model_properties for all
-/// upstream models, so users can avoid "model metadata not found" warnings.
-async fn print_codex_config(client: &Client, upstream: &Url, api_key: &str, provider_name: &str) {
+/// Print a Codex config.toml snippet and optionally generate the full model
+/// catalog required by recent Codex versions.
+async fn print_codex_config(
+    client: &Client,
+    upstream: &Url,
+    api_key: &str,
+    provider_name: &str,
+    model_catalog_path: Option<&std::path::Path>,
+    model_template: Option<&str>,
+) -> Result<()> {
     let url = format!("{}models", join_base(upstream));
     let mut builder = client.get(&url);
     if !api_key.is_empty() {
@@ -283,45 +373,202 @@ async fn print_codex_config(client: &Client, upstream: &Url, api_key: &str, prov
         }
     };
 
+    if let Some(path) = model_catalog_path {
+        let bundled = load_bundled_codex_catalog()?;
+        let catalog = build_model_catalog(bundled, &models, model_template, provider_name)?;
+        let bytes = serde_json::to_vec_pretty(&catalog)?;
+        fs::write(path, bytes)
+            .with_context(|| format!("failed to write model catalog to {}", path.display()))?;
+    }
+
     println!(
         "# ── Codex config snippet for {} ──",
         upstream.host_str().unwrap_or("custom")
     );
     println!("# Copy the lines below into ~/.codex/config.toml");
     println!();
-    println!("model_provider = \"{provider_name}\"");
+    println!("model_provider = {}", toml_string(provider_name)?);
 
     if !models.is_empty() && !models[0].starts_with('<') {
-        println!("model = \"{}\"", models[0]);
+        println!("model = {}", toml_string(&models[0])?);
     } else {
         println!("model = \"<CHOOSE_A_MODEL>\"");
     }
+    if let Some(path) = model_catalog_path {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let absolute = absolute
+            .to_str()
+            .context("model catalog path is not valid UTF-8")?;
+        println!("model_catalog_json = {}", toml_string(absolute)?);
+    } else {
+        println!("# To register upstream models in Codex's model picker, rerun with:");
+        println!("#   --model-catalog ~/.codex/codex-relay-models.json");
+    }
     println!();
-    println!("[model_providers.{provider_name}]");
-    println!("name = \"{}\"", provider_name);
-    println!("base_url = \"{}\"", upstream.as_str().trim_end_matches('/'));
-    println!("wire_api = \"responses\"");
+    println!("[model_providers.{}]", toml_string(provider_name)?);
+    println!("name = {}", toml_string(provider_name)?);
     println!(
-        "env_key = \"{}_API_KEY\"",
+        "base_url = {}",
+        toml_string(upstream.as_str().trim_end_matches('/'))?
+    );
+    println!("wire_api = \"responses\"");
+    let env_key = format!(
+        "{}_API_KEY",
         provider_name.to_uppercase().replace(['-', '.'], "_")
     );
+    println!("env_key = {}", toml_string(&env_key)?);
     println!();
+    Ok(())
+}
 
-    for model in &models {
-        let props = estimate_model_properties(model);
-        println!("[model_properties.\"{}\"]", model);
-        println!("context_window = {}", props.context_window);
-        println!("max_context_window = {}", props.max_context_window);
-        println!(
-            "supports_parallel_tool_calls = {}",
-            props.supports_parallel_tool_calls
+fn toml_string(value: &str) -> Result<String> {
+    serde_json::to_string(value).context("failed to quote TOML string")
+}
+
+fn load_bundled_codex_catalog() -> Result<serde_json::Value> {
+    let output = Command::new("codex")
+        .args(["debug", "models", "--bundled"])
+        .output()
+        .context("failed to run `codex debug models --bundled`; install Codex CLI or omit --model-catalog")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("`codex debug models --bundled` failed: {}", stderr.trim());
+    }
+    serde_json::from_slice(&output.stdout)
+        .context("failed to parse the bundled model catalog from the installed Codex CLI")
+}
+
+fn build_model_catalog(
+    mut catalog: serde_json::Value,
+    upstream_models: &[String],
+    template_slug: Option<&str>,
+    provider_name: &str,
+) -> Result<serde_json::Value> {
+    let models = catalog
+        .get_mut("models")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("the installed Codex CLI returned a catalog without a models array")?;
+    let template = if let Some(slug) = template_slug {
+        models
+            .iter()
+            .find(|model| model.get("slug").and_then(serde_json::Value::as_str) == Some(slug))
+            .cloned()
+            .with_context(|| {
+                format!("model template `{slug}` was not found in the bundled catalog")
+            })?
+    } else {
+        models
+            .iter()
+            .find(|model| {
+                model.get("visibility").and_then(serde_json::Value::as_str) == Some("list")
+            })
+            .or_else(|| models.first())
+            .cloned()
+            .context("the installed Codex CLI returned an empty bundled catalog")?
+    };
+
+    for (index, slug) in upstream_models.iter().enumerate() {
+        if slug.starts_with('<') {
+            continue;
+        }
+        let existing_index = models
+            .iter()
+            .position(|model| model.get("slug").and_then(serde_json::Value::as_str) == Some(slug));
+        let props = estimate_model_properties(slug);
+        let mut model = template.clone();
+        let object = model
+            .as_object_mut()
+            .context("the bundled model template was not a JSON object")?;
+        object.insert("slug".into(), serde_json::Value::String(slug.clone()));
+        object.insert(
+            "display_name".into(),
+            serde_json::Value::String(slug.clone()),
         );
-        println!(
-            "supports_reasoning_summaries = {}",
-            props.supports_reasoning_summaries
+        object.insert(
+            "description".into(),
+            serde_json::Value::String(format!("{slug} via {provider_name}")),
         );
-        println!("input_modalities = [\"text\"]");
-        println!();
+        object.insert(
+            "visibility".into(),
+            serde_json::Value::String("list".into()),
+        );
+        object.insert("supported_in_api".into(), serde_json::Value::Bool(true));
+        object.insert("priority".into(), serde_json::json!(10_000 + index));
+        object.insert(
+            "context_window".into(),
+            serde_json::json!(props.context_window),
+        );
+        object.insert(
+            "max_context_window".into(),
+            serde_json::json!(props.max_context_window),
+        );
+        object.insert(
+            "supports_parallel_tool_calls".into(),
+            serde_json::Value::Bool(props.supports_parallel_tool_calls),
+        );
+        set_existing(
+            object,
+            "supports_reasoning_summaries",
+            serde_json::Value::Bool(props.supports_reasoning_summaries),
+        );
+        set_existing(
+            object,
+            "supports_reasoning_summary_parameter",
+            serde_json::Value::Bool(props.supports_reasoning_summaries),
+        );
+        object.insert("input_modalities".into(), serde_json::json!(["text"]));
+
+        // Preserve version-sensitive instructions and tool encodings from the
+        // template, while disabling capabilities the relay does not promise.
+        set_existing(object, "prefer_websockets", serde_json::Value::Bool(false));
+        object.insert("support_verbosity".into(), serde_json::Value::Bool(false));
+        object.insert("default_verbosity".into(), serde_json::Value::Null);
+        object.insert("default_reasoning_level".into(), serde_json::Value::Null);
+        object.insert("supported_reasoning_levels".into(), serde_json::json!([]));
+        set_existing(
+            object,
+            "supports_image_detail_original",
+            serde_json::Value::Bool(false),
+        );
+        object.insert(
+            "supports_search_tool".into(),
+            serde_json::Value::Bool(false),
+        );
+        object.insert("use_responses_lite".into(), serde_json::Value::Bool(false));
+        object.insert("tool_mode".into(), serde_json::Value::Null);
+        object.insert("multi_agent_version".into(), serde_json::Value::Null);
+        object.insert("experimental_supported_tools".into(), serde_json::json!([]));
+        object.insert("additional_speed_tiers".into(), serde_json::json!([]));
+        object.insert("service_tiers".into(), serde_json::json!([]));
+        object.insert("default_service_tier".into(), serde_json::Value::Null);
+        object.insert("availability_nux".into(), serde_json::Value::Null);
+        object.insert("upgrade".into(), serde_json::Value::Null);
+        object.insert("auto_review_model_override".into(), serde_json::Value::Null);
+        object.insert("auto_compact_token_limit".into(), serde_json::Value::Null);
+        object.insert("comp_hash".into(), serde_json::Value::Null);
+        object.remove("minimal_client_version");
+        object.remove("available_in_plans");
+        if let Some(index) = existing_index {
+            models[index] = model;
+        } else {
+            models.push(model);
+        }
+    }
+
+    Ok(catalog)
+}
+
+fn set_existing(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+) {
+    if object.contains_key(key) {
+        object.insert(key.into(), value);
     }
 }
 
@@ -523,28 +770,29 @@ fn chat_response_tool_call_debug_names(chat_resp: &ChatResponse) -> Vec<String> 
         .collect()
 }
 
-async fn handle_responses(State(state): State<AppState>, req: Request) -> Response {
-    let auth_header = req
-        .headers()
+fn request_authorization(headers: &HeaderMap) -> Option<String> {
+    headers
         .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
 
-    let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("body read error: {e}");
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    };
-
+async fn handle_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let authorization = request_authorization(&headers);
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
-            error!("JSON parse error: {e}");
             error!(
-                "body prefix: {}",
-                String::from_utf8_lossy(&body[..body.len().min(200)])
+                error_category = ?e.classify(),
+                line = e.line(),
+                column = e.column(),
+                body_bytes = body.len(),
+                "JSON parse error"
             );
             return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
         }
@@ -565,19 +813,25 @@ async fn handle_responses(State(state): State<AppState>, req: Request) -> Respon
         summarize_debug_names(response_tool_debug_names(&req.tools))
     );
 
-    handle_responses_inner(state, req, auth_header).await
+    handle_responses_inner(state, req, authorization).await
 }
 
 async fn handle_responses_inner(
     state: AppState,
-    req: ResponsesRequest,
-    auth_header: Option<String>,
+    mut req: ResponsesRequest,
+    authorization: Option<String>,
 ) -> Response {
+    if let Err(message) = translate::validate_unique_chat_tool_names(&req.tools) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
+    }
     let mut history = req
         .previous_response_id
         .as_deref()
         .map(|id| state.sessions.get_history(id))
         .unwrap_or_default();
+    if let Err(message) = normalize_agent_message_content(&mut req.input, &history) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
+    }
     if should_isolate_spawn_child_request(&req, &history) {
         debug!("isolating spawned child request from parent response history");
         history.clear();
@@ -585,6 +839,7 @@ async fn handle_responses_inner(
 
     let model = req.model.clone();
     let namespace_tools = translate::namespace_tool_map(&req.tools);
+    let custom_tools = translate::custom_tool_map(&req.tools);
     let mut chat_req = translate::to_chat_request(&req, history, &state.sessions);
     debug!(
         "→ upstream tools={}",
@@ -592,14 +847,7 @@ async fn handle_responses_inner(
     );
     let url = format!("{}chat/completions", join_base(&state.upstream));
 
-    let effective_auth = auth_header.or_else(|| {
-        if !state.api_key.is_empty() {
-            Some(format!("Bearer {}", state.api_key))
-        } else {
-            None
-        }
-    });
-
+    let previous_response_id = req.previous_response_id.clone();
     if req.stream {
         let response_id = state.sessions.new_id();
         chat_req.stream = true;
@@ -607,55 +855,147 @@ async fn handle_responses_inner(
         stream::translate_stream(stream::StreamArgs {
             client: state.client,
             url,
-            auth_header: effective_auth,
+            authorization: authorization.clone(),
             chat_req,
+            upstream_request: state.upstream_request,
             response_id,
             sessions: state.sessions,
             request_messages,
             namespace_tools,
+            custom_tools,
             model,
+            corpus: state.corpus,
+            previous_response_id,
         })
         .into_response()
     } else {
         chat_req.stream = false;
-        handle_blocking(state, chat_req, url, model, namespace_tools, effective_auth).await
+        handle_blocking(
+            state,
+            chat_req,
+            url,
+            model,
+            namespace_tools,
+            custom_tools,
+            previous_response_id,
+            authorization,
+        )
+        .await
     }
 }
 
 fn should_isolate_spawn_child_request(req: &ResponsesRequest, history: &[ChatMessage]) -> bool {
-    let Some(input_text) = isolated_user_text(&req.input) else {
+    let Some(input) = isolated_child_input(&req.input) else {
         return false;
     };
+    let pending_spawns = pending_spawn_agent_calls(history);
+
+    if let Some(recipient) = input.recipient.as_deref() {
+        return pending_spawns
+            .iter()
+            .any(|spawn| spawn.matches_recipient(recipient));
+    }
+
+    if pending_spawns
+        .iter()
+        .any(|spawn| spawn.message.as_deref() == input.text.as_deref())
+    {
+        return true;
+    }
+
+    pending_spawns.len() == 1 && pending_spawns[0].is_v2_encrypted_candidate()
+}
+
+fn pending_spawn_agent_calls(history: &[ChatMessage]) -> Vec<SpawnAgentCall> {
+    let mut call_id_counts = std::collections::HashMap::new();
+    for call_id in history
+        .iter()
+        .flat_map(|msg| msg.tool_calls.as_deref().unwrap_or(&[]))
+        .filter_map(|call| call.get("id").and_then(serde_json::Value::as_str))
+    {
+        *call_id_counts.entry(call_id).or_insert(0usize) += 1;
+    }
     let completed_tool_calls: std::collections::HashSet<&str> = history
         .iter()
         .filter_map(|msg| msg.tool_call_id.as_deref())
         .collect();
-    history.iter().any(|msg| {
-        msg.tool_calls.as_deref().unwrap_or(&[]).iter().any(|call| {
+    history
+        .iter()
+        .flat_map(|msg| msg.tool_calls.as_deref().unwrap_or(&[]))
+        .filter(|call| {
             let call_id = call.get("id").and_then(serde_json::Value::as_str);
-            call_id.is_none_or(|id| !completed_tool_calls.contains(id))
-                && spawn_agent_message(call).is_some_and(|message| message == input_text)
+            call_id.is_none_or(|id| {
+                id.is_empty()
+                    || call_id_counts.get(id) != Some(&1)
+                    || !completed_tool_calls.contains(id)
+            })
         })
-    })
+        .filter_map(parse_spawn_agent_call)
+        .collect()
 }
 
-fn isolated_user_text(input: &ResponsesInput) -> Option<&str> {
+struct IsolatedChildInput {
+    text: Option<String>,
+    recipient: Option<String>,
+}
+
+fn isolated_child_input(input: &ResponsesInput) -> Option<IsolatedChildInput> {
     match input {
-        ResponsesInput::Text(text) => Some(text.as_str()),
+        ResponsesInput::Text(text) => Some(IsolatedChildInput {
+            text: Some(text.clone()),
+            recipient: None,
+        }),
         ResponsesInput::Messages(items) => {
             if items.len() != 1 {
                 return None;
             }
             let item = &items[0];
-            if item.get("type").and_then(serde_json::Value::as_str) != Some("message")
-                || item.get("role").and_then(serde_json::Value::as_str) != Some("user")
-            {
-                return None;
-            }
-            match item.get("content") {
-                Some(serde_json::Value::String(text)) => Some(text.as_str()),
-                Some(serde_json::Value::Array(parts)) if parts.len() == 1 => {
-                    parts[0].get("text").and_then(serde_json::Value::as_str)
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("message")
+                    if item.get("role").and_then(serde_json::Value::as_str) == Some("user") =>
+                {
+                    let text = match item.get("content") {
+                        Some(serde_json::Value::String(text)) => Some(text.clone()),
+                        Some(serde_json::Value::Array(parts)) if parts.len() == 1 => parts[0]
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from),
+                        _ => None,
+                    }?;
+                    Some(IsolatedChildInput {
+                        text: Some(text),
+                        recipient: None,
+                    })
+                }
+                Some("agent_message") => {
+                    let recipient = item
+                        .get("recipient")
+                        .and_then(serde_json::Value::as_str)?
+                        .to_string();
+                    let parts = item.get("content").and_then(serde_json::Value::as_array)?;
+                    if parts.iter().any(|part| {
+                        !matches!(
+                            part.get("type").and_then(serde_json::Value::as_str),
+                            Some("input_text" | "text")
+                        ) || part
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none()
+                    }) {
+                        return None;
+                    }
+                    let text = parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(IsolatedChildInput {
+                        text: Some(text),
+                        recipient: Some(recipient),
+                    })
                 }
                 _ => None,
             }
@@ -663,12 +1003,154 @@ fn isolated_user_text(input: &ResponsesInput) -> Option<&str> {
     }
 }
 
-fn spawn_agent_message(call: &serde_json::Value) -> Option<String> {
+fn normalize_agent_message_content(
+    input: &mut ResponsesInput,
+    history: &[ChatMessage],
+) -> Result<(), &'static str> {
+    let ResponsesInput::Messages(items) = input else {
+        return Ok(());
+    };
+    let pending_spawns = pending_spawn_agent_calls(history);
+    for item in items {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("agent_message") {
+            continue;
+        }
+        if contains_encrypted_content(item.get("content").unwrap_or(&serde_json::Value::Null)) {
+            normalize_legacy_encrypted_agent_message(item, &pending_spawns)?;
+        }
+        let content = item.get("content").unwrap_or(&serde_json::Value::Null);
+        let Some(parts) = content.as_array() else {
+            return Err("agent_message content must be an array of plaintext text parts");
+        };
+        if parts.is_empty()
+            || parts.iter().any(|part| {
+                !matches!(
+                    part.get("type").and_then(serde_json::Value::as_str),
+                    Some("input_text" | "text")
+                ) || part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+            })
+        {
+            return Err("agent_message content must contain only plaintext text parts");
+        }
+    }
+    Ok(())
+}
+
+/// Recover the legacy non-OpenAI V2 shape only when session history proves the
+/// wrapper contains the exact plaintext task. Never infer plaintext from the
+/// encrypted value's format: genuine provider ciphertext must remain rejected.
+fn normalize_legacy_encrypted_agent_message(
+    item: &mut serde_json::Value,
+    pending_spawns: &[SpawnAgentCall],
+) -> Result<(), &'static str> {
+    let recipient = item
+        .get("recipient")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        )?;
+    let parts = item
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        )?;
+    let encrypted_parts = parts
+        .iter()
+        .filter(|part| {
+            part.get("type").and_then(serde_json::Value::as_str) == Some("encrypted_content")
+        })
+        .collect::<Vec<_>>();
+    if encrypted_parts.len() != 1
+        || parts.iter().any(|part| {
+            !matches!(
+                part.get("type").and_then(serde_json::Value::as_str),
+                Some("input_text" | "text" | "encrypted_content")
+            )
+        })
+    {
+        return Err(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        );
+    }
+    let wrapped_text = encrypted_parts[0]
+        .get("encrypted_content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        )?
+        .to_string();
+    let matching_spawns = pending_spawns
+        .iter()
+        .filter(|spawn| {
+            spawn.matches_recipient(recipient)
+                && spawn.message.as_deref() == Some(wrapped_text.as_str())
+        })
+        .count();
+    if matching_spawns != 1 {
+        return Err(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        );
+    }
+
+    let parts = item
+        .get_mut("content")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("agent_message content checked as array");
+    for part in parts {
+        if part.get("type").and_then(serde_json::Value::as_str) == Some("encrypted_content") {
+            *part = serde_json::json!({"type": "input_text", "text": &wrapped_text});
+        }
+    }
+    Ok(())
+}
+
+fn contains_encrypted_content(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(contains_encrypted_content),
+        serde_json::Value::Object(object) => {
+            object.get("type").and_then(serde_json::Value::as_str) == Some("encrypted_content")
+                || object.values().any(contains_encrypted_content)
+        }
+        _ => false,
+    }
+}
+
+struct SpawnAgentCall {
+    task_name: Option<String>,
+    message: Option<String>,
+    fork_turns: Option<String>,
+}
+
+impl SpawnAgentCall {
+    fn is_v2_encrypted_candidate(&self) -> bool {
+        self.fork_turns.is_some()
+            && self
+                .message
+                .as_deref()
+                .is_some_and(|message| !message.is_empty())
+    }
+
+    fn matches_recipient(&self, recipient: &str) -> bool {
+        self.task_name.as_deref().is_some_and(|task_name| {
+            !task_name.is_empty()
+                && (recipient == task_name
+                    || recipient
+                        .strip_suffix(task_name)
+                        .is_some_and(|prefix| prefix.ends_with('/')))
+        })
+    }
+}
+
+fn parse_spawn_agent_call(call: &serde_json::Value) -> Option<SpawnAgentCall> {
     if call
         .get("function")
         .and_then(|function| function.get("name"))
         .and_then(serde_json::Value::as_str)
-        != Some("spawn_agent")
+        .is_none_or(|name| !matches!(name, "spawn_agent" | "collaboration-spawn_agent"))
     {
         return None;
     }
@@ -677,10 +1159,20 @@ fn spawn_agent_message(call: &serde_json::Value) -> Option<String> {
         .and_then(|function| function.get("arguments"))
         .and_then(serde_json::Value::as_str)?;
     let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    arguments
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .map(String::from)
+    Some(SpawnAgentCall {
+        task_name: arguments
+            .get("task_name")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        message: arguments
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        fork_turns: arguments
+            .get("fork_turns")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+    })
 }
 
 async fn handle_blocking(
@@ -689,19 +1181,30 @@ async fn handle_blocking(
     url: String,
     model: String,
     namespace_tools: translate::NamespaceToolMap,
-    auth_header: Option<String>,
+    custom_tools: translate::CustomToolMap,
+    previous_response_id: Option<String>,
+    authorization: Option<String>,
 ) -> Response {
     let mut builder = state
         .client
         .post(&url)
-        .header("Content-Type", "application/json")
-        .header("x-bf-passthrough-extra-params", "true");
+        .header("Content-Type", "application/json");
 
-    if let Some(auth) = auth_header {
-        builder = builder.header("Authorization", auth);
+    if let Some(authorization) = authorization {
+        builder = builder.header("Authorization", authorization);
     }
 
-    match builder.json(&chat_req).send().await {
+    let upstream_body = match state.upstream_request.request_body(&chat_req) {
+        Ok(body) => body,
+        Err(e) => {
+            error!("upstream request body error: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+    let allowed_tool_names =
+        translate::allowed_upstream_tool_names(&chat_req.tools, &upstream_body);
+
+    match builder.json(&upstream_body).send().await {
         Err(e) => {
             error!("upstream error: {e}");
             (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
@@ -716,46 +1219,98 @@ async fn handle_blocking(
             )
                 .into_response()
         }
-        Ok(r) => match r.json::<ChatResponse>().await {
-            Err(e) => {
-                error!("parse error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        Ok(r) => {
+            let value = match r.json::<serde_json::Value>().await {
+                Ok(value) => value,
+                Err(e) => {
+                    error!("parse error: {e}");
+                    return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+                }
+            };
+            if let Some(upstream_error) = value.get("error") {
+                let message = upstream_error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| upstream_error.as_str())
+                    .unwrap_or("upstream returned an error")
+                    .to_string();
+                error!("upstream response error: {message}");
+                return (StatusCode::BAD_GATEWAY, message).into_response();
             }
-            Ok(chat_resp) => {
-                debug!(
-                    "← upstream function_calls={}",
-                    summarize_debug_names(chat_response_tool_call_debug_names(&chat_resp))
-                );
-                let assistant_msg = chat_resp
-                    .choices
-                    .first()
-                    .map(|c| c.message.clone())
-                    .unwrap_or_else(|| ChatMessage {
-                        role: "assistant".into(),
-                        content: Some(serde_json::Value::String(String::new())),
-                        reasoning_content: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                    });
+            match serde_json::from_value::<ChatResponse>(value) {
+                Err(e) => {
+                    error!("parse error: {e}");
+                    (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                }
+                Ok(chat_resp) => {
+                    debug!(
+                        "← upstream function_calls={}",
+                        summarize_debug_names(chat_response_tool_call_debug_names(&chat_resp))
+                    );
+                    let response_id = state.sessions.new_id();
+                    let (resp, assistant_messages) =
+                        if namespace_tools.is_empty() && custom_tools.is_empty() {
+                            translate::from_chat_response(response_id.clone(), &model, chat_resp)
+                        } else {
+                            translate::from_chat_response_with_tool_maps(
+                                response_id.clone(),
+                                &model,
+                                chat_resp,
+                                &namespace_tools,
+                                &custom_tools,
+                            )
+                        };
+                    let tool_call_entries = assistant_messages
+                        .iter()
+                        .flat_map(|message| message.tool_calls.as_deref().unwrap_or(&[]))
+                        .map(|call| {
+                            let call_id = call
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            let name = call
+                                .get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            (call_id, name)
+                        });
+                    if let Err(message) = translate::validate_tool_call_entries(
+                        tool_call_entries,
+                        &allowed_tool_names,
+                    ) {
+                        warn!("rejecting invalid upstream tool calls: {message}");
+                        return (StatusCode::BAD_GATEWAY, message).into_response();
+                    }
 
-                let mut full_history = chat_req.messages.clone();
-                full_history.push(assistant_msg);
-                let response_id = state.sessions.save(full_history);
-
-                let (resp, _) = if namespace_tools.is_empty() {
-                    translate::from_chat_response(response_id, &model, chat_resp)
-                } else {
-                    translate::from_chat_response_with_tool_map(
-                        response_id,
-                        &model,
-                        chat_resp,
-                        &namespace_tools,
-                    )
-                };
-                Json(resp).into_response()
+                    for assistant in &assistant_messages {
+                        if let Some(reasoning) = assistant
+                            .reasoning_content
+                            .as_ref()
+                            .filter(|reasoning| !reasoning.is_empty())
+                        {
+                            state.sessions.store_turn_reasoning(
+                                &chat_req.messages,
+                                assistant,
+                                reasoning.clone(),
+                            );
+                        }
+                    }
+                    let mut full_history = chat_req.messages;
+                    full_history.extend(assistant_messages);
+                    if let Some(corpus) = &state.corpus {
+                        corpus.record_turn(
+                            previous_response_id.as_deref(),
+                            &response_id,
+                            &model,
+                            &full_history,
+                        );
+                    }
+                    state.sessions.save_with_id(response_id, full_history);
+                    Json(resp).into_response()
+                }
             }
-        },
+        }
     }
 }
 
@@ -763,6 +1318,18 @@ async fn handle_blocking(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_request_authorization_reads_only_incoming_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer request-scoped".parse().unwrap());
+
+        assert_eq!(
+            request_authorization(&headers),
+            Some("Bearer request-scoped".to_string())
+        );
+        assert_eq!(request_authorization(&HeaderMap::new()), None);
+    }
 
     #[test]
     fn test_validate_upstream_https() {
@@ -872,13 +1439,12 @@ mod tests {
             input: ResponsesInput::Text("child task".into()),
             previous_response_id: Some("resp_parent".into()),
             tools: vec![],
-            tool_choice: None,
             stream: false,
             temperature: None,
             max_output_tokens: None,
-            reasoning: None,
             system: None,
             instructions: None,
+            reasoning: None,
         };
         let history = vec![ChatMessage {
             role: "assistant".into(),
@@ -900,6 +1466,323 @@ mod tests {
     }
 
     #[test]
+    fn test_plaintext_agent_message_isolated_by_recipient() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Messages(vec![json!({
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/worker-b",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Message Type: NEW_TASK\nPayload:\ndo B"
+                }]
+            })]),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+            reasoning: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![
+                json!({
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {
+                        "name": "collaboration-spawn_agent",
+                        "arguments": "{\"task_name\":\"worker-a\",\"message\":\"do A\"}"
+                    }
+                }),
+                json!({
+                    "id": "call_b",
+                    "type": "function",
+                    "function": {
+                        "name": "collaboration-spawn_agent",
+                        "arguments": "{\"task_name\":\"worker-b\",\"message\":\"do B\"}"
+                    }
+                }),
+            ]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_plaintext_agent_message_does_not_isolate_unmatched_recipient() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Messages(vec![json!({
+                "type": "agent_message",
+                "recipient": "/root/existing-child",
+                "content": [{"type": "input_text", "text": "follow up"}]
+            })]),
+            previous_response_id: Some("resp_child".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+            reasoning: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_new",
+                "type": "function",
+                "function": {
+                    "name": "collaboration-spawn_agent",
+                    "arguments": "{\"task_name\":\"new-child\",\"message\":\"new task\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(!should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_encrypted_agent_message_is_rejected_before_translation() {
+        for content in [
+            json!([
+                {"type": "input_text", "text": "routing"},
+                {"type": "encrypted_content", "encrypted_content": "opaque-secret"}
+            ]),
+            json!({"type": "encrypted_content", "encrypted_content": "opaque-secret"}),
+            json!([{
+                "type": "wrapper",
+                "payload": {"type": "encrypted_content", "encrypted_content": "opaque-secret"}
+            }]),
+        ] {
+            let mut input = ResponsesInput::Messages(vec![json!({
+                "type": "agent_message",
+                "recipient": "/root/worker",
+                "content": content
+            })]);
+            assert!(normalize_agent_message_content(&mut input, &[]).is_err());
+            assert!(isolated_child_input(&input).is_none());
+        }
+    }
+
+    #[test]
+    fn test_opaque_agent_message_is_not_treated_as_plaintext_child() {
+        let mut input = ResponsesInput::Messages(vec![json!({
+            "type": "agent_message",
+            "recipient": "/root/worker",
+            "content": [{"type": "unknown", "payload": "opaque"}]
+        })]);
+
+        assert!(normalize_agent_message_content(&mut input, &[]).is_err());
+        assert!(isolated_child_input(&input).is_none());
+    }
+
+    #[test]
+    fn test_legacy_encrypted_agent_message_is_normalized_on_exact_pending_spawn_match() {
+        let task = "请列出当前目录下的文件。";
+        let mut input = ResponsesInput::Messages(vec![json!({
+            "type": "agent_message",
+            "recipient": "/root/list_files",
+            "content": [
+                {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+                {"type": "encrypted_content", "encrypted_content": task}
+            ]
+        })]);
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "collaboration-spawn_agent",
+                    "arguments": json!({
+                        "fork_turns": "none",
+                        "message": task,
+                        "task_name": "list_files"
+                    }).to_string()
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(normalize_agent_message_content(&mut input, &history).is_ok());
+        let ResponsesInput::Messages(items) = &input else {
+            panic!("message input");
+        };
+        assert_eq!(
+            items[0]["content"][1],
+            json!({"type": "input_text", "text": task})
+        );
+        assert!(isolated_child_input(&input).is_some());
+    }
+
+    #[test]
+    fn test_legacy_encrypted_agent_message_rejects_ambiguous_pending_spawn_match() {
+        let task = "same task";
+        let mut input = ResponsesInput::Messages(vec![json!({
+            "type": "agent_message",
+            "recipient": "/root/worker",
+            "content": [{"type": "encrypted_content", "encrypted_content": task}]
+        })]);
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(
+                ["call_a", "call_b"]
+                    .into_iter()
+                    .map(|call_id| {
+                        json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "collaboration-spawn_agent",
+                                "arguments": json!({
+                                    "message": task,
+                                    "task_name": "worker"
+                                }).to_string()
+                            }
+                        })
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(normalize_agent_message_content(&mut input, &history).is_err());
+        assert!(contains_encrypted_content(match &input {
+            ResponsesInput::Messages(items) => &items[0]["content"],
+            ResponsesInput::Text(_) => unreachable!(),
+        }));
+    }
+
+    #[test]
+    fn test_legacy_encrypted_agent_message_requires_both_recipient_and_message_match() {
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "collaboration-spawn_agent",
+                    "arguments": "{\"task_name\":\"worker\",\"message\":\"expected task\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        for (recipient, wrapped_text) in [
+            ("/root/other-worker", "expected task"),
+            ("/root/worker", "gAAAAA-opaque-ciphertext"),
+        ] {
+            let mut input = ResponsesInput::Messages(vec![json!({
+                "type": "agent_message",
+                "recipient": recipient,
+                "content": [{
+                    "type": "encrypted_content",
+                    "encrypted_content": wrapped_text
+                }]
+            })]);
+
+            assert!(normalize_agent_message_content(&mut input, &history).is_err());
+        }
+    }
+
+    #[test]
+    fn test_spawn_child_request_isolated_for_single_v2_encrypted_spawn() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Text("child task decrypted by codex".into()),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+            reasoning: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "arguments": "{\"task_name\":\"child\",\"fork_turns\":\"current_turn\",\"message\":\"encrypted:v2:ciphertext\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_spawn_child_v2_encrypted_fallback_requires_unambiguous_spawn() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Text("child task decrypted by codex".into()),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+            reasoning: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![
+                json!({
+                    "id": "call_spawn_a",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"task_name\":\"a\",\"fork_turns\":\"current_turn\",\"message\":\"encrypted:v2:a\"}"
+                    }
+                }),
+                json!({
+                    "id": "call_spawn_b",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"task_name\":\"b\",\"fork_turns\":\"current_turn\",\"message\":\"encrypted:v2:b\"}"
+                    }
+                }),
+            ]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(!should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
     fn test_spawn_child_isolation_does_not_match_tool_outputs() {
         let req = ResponsesRequest {
             model: "test".into(),
@@ -910,13 +1793,12 @@ mod tests {
             })]),
             previous_response_id: Some("resp_parent".into()),
             tools: vec![],
-            tool_choice: None,
             stream: false,
             temperature: None,
             max_output_tokens: None,
-            reasoning: None,
             system: None,
             instructions: None,
+            reasoning: None,
         };
         let history = vec![ChatMessage {
             role: "assistant".into(),
@@ -944,13 +1826,12 @@ mod tests {
             input: ResponsesInput::Text("child task".into()),
             previous_response_id: Some("resp_parent".into()),
             tools: vec![],
-            tool_choice: None,
             stream: false,
             temperature: None,
             max_output_tokens: None,
-            reasoning: None,
             system: None,
             instructions: None,
+            reasoning: None,
         };
         let history = vec![
             ChatMessage {
@@ -982,6 +1863,63 @@ mod tests {
     }
 
     #[test]
+    fn test_duplicate_spawn_call_ids_cannot_disable_child_isolation() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Messages(vec![json!({
+                "type": "agent_message",
+                "recipient": "/root/worker-b",
+                "content": [{"type": "input_text", "text": "task B"}]
+            })]),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+            reasoning: None,
+        };
+        let history = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![
+                    json!({
+                        "id": "duplicate",
+                        "type": "function",
+                        "function": {
+                            "name": "collaboration-spawn_agent",
+                            "arguments": "{\"task_name\":\"worker-a\",\"message\":\"task A\"}"
+                        }
+                    }),
+                    json!({
+                        "id": "duplicate",
+                        "type": "function",
+                        "function": {
+                            "name": "collaboration-spawn_agent",
+                            "arguments": "{\"task_name\":\"worker-b\",\"message\":\"task B\"}"
+                        }
+                    }),
+                ]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(serde_json::Value::String("spawned worker-a".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("duplicate".into()),
+                name: None,
+            },
+        ];
+
+        assert!(should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
     fn test_estimate_model_properties_deepseek() {
         let props = estimate_model_properties("deepseek-v4-pro");
         assert_eq!(props.context_window, 262_144);
@@ -1003,5 +1941,126 @@ mod tests {
         assert_eq!(props.max_context_window, 128_000);
         assert!(!props.supports_reasoning_summaries);
         assert!(props.supports_parallel_tool_calls);
+    }
+
+    #[test]
+    fn test_toml_string_quotes_untrusted_model_ids() {
+        assert_eq!(
+            toml_string("model\"\nnotify = [\"bad\"]").unwrap(),
+            "\"model\\\"\\nnotify = [\\\"bad\\\"]\""
+        );
+    }
+
+    #[test]
+    fn test_build_model_catalog_preserves_bundled_models_and_template_protocol() {
+        let bundled = serde_json::json!({
+            "models": [{
+                "slug": "codex-template",
+                "display_name": "Codex Template",
+                "description": "bundled",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 1,
+                "base_instructions": "version-matched instructions",
+                "model_messages": {"instructions_template": "version-matched template"},
+                "shell_type": "shell_command",
+                "apply_patch_tool_type": "freeform",
+                "prefer_websockets": true,
+                "support_verbosity": true,
+                "default_verbosity": "medium",
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [{"effort": "high", "description": "deep"}],
+                "supports_reasoning_summaries": true,
+                "supports_reasoning_summary_parameter": true,
+                "supports_search_tool": true,
+                "supports_image_detail_original": true,
+                "use_responses_lite": true,
+                "tool_mode": "code_mode_only",
+                "multi_agent_version": "v2",
+                "experimental_supported_tools": ["unknown"],
+                "additional_speed_tiers": ["fast"],
+                "service_tiers": [{"id": "fast"}],
+                "availability_nux": {"message": "new"},
+                "upgrade": {"id": "next"},
+                "comp_hash": "template-only"
+            }]
+        });
+
+        let catalog = build_model_catalog(
+            bundled,
+            &["deepseek-r1".into()],
+            Some("codex-template"),
+            "provider",
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["slug"], "codex-template");
+        let generated = &models[1];
+        assert_eq!(generated["slug"], "deepseek-r1");
+        assert_eq!(
+            generated["base_instructions"],
+            "version-matched instructions"
+        );
+        assert_eq!(
+            generated["model_messages"]["instructions_template"],
+            "version-matched template"
+        );
+        assert_eq!(generated["shell_type"], "shell_command");
+        assert_eq!(generated["apply_patch_tool_type"], "freeform");
+        assert_eq!(generated["prefer_websockets"], false);
+        assert_eq!(
+            generated["supported_reasoning_levels"],
+            serde_json::json!([])
+        );
+        assert_eq!(generated["supports_reasoning_summaries"], true);
+        assert_eq!(generated["supports_reasoning_summary_parameter"], true);
+        assert_eq!(generated["supports_image_detail_original"], false);
+        assert_eq!(generated["context_window"], 262_144);
+        assert_eq!(generated["tool_mode"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_build_model_catalog_sanitizes_bundled_slug_collision() {
+        let bundled = serde_json::json!({"models": [{
+            "slug": "same-model",
+            "display_name": "Bundled",
+            "visibility": "list",
+            "prefer_websockets": true,
+            "supports_reasoning_summary_parameter": true,
+            "supports_search_tool": true,
+            "supports_image_detail_original": true,
+            "use_responses_lite": true,
+            "tool_mode": "code_mode_only",
+            "multi_agent_version": "v2"
+        }]});
+
+        let catalog = build_model_catalog(
+            bundled,
+            &["same-model".into()],
+            Some("same-model"),
+            "provider",
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["display_name"], "same-model");
+        assert_eq!(models[0]["prefer_websockets"], false);
+        assert_eq!(models[0]["supports_reasoning_summary_parameter"], false);
+        assert_eq!(models[0]["supports_search_tool"], false);
+        assert_eq!(models[0]["supports_image_detail_original"], false);
+        assert_eq!(models[0]["use_responses_lite"], false);
+        assert_eq!(models[0]["tool_mode"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_build_model_catalog_rejects_unknown_template() {
+        let bundled = serde_json::json!({"models": [{
+            "slug": "known",
+            "visibility": "list"
+        }]});
+        let error = build_model_catalog(bundled, &["upstream".into()], Some("missing"), "provider")
+            .unwrap_err();
+        assert!(error.to_string().contains("was not found"));
     }
 }

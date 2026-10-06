@@ -12,23 +12,27 @@ pub struct ResponsesRequest {
     #[serde(default)]
     pub tools: Vec<Value>,
     #[serde(default)]
-    pub tool_choice: Option<Value>,
-    #[serde(default)]
     pub stream: bool,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
-    #[serde(default)]
-    pub reasoning: Option<ResponsesReasoning>,
     /// Responses API system prompt field (some clients use `system`, others `instructions`)
     #[serde(default)]
     pub system: Option<String>,
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Responses-API reasoning controls. Codex sends `"reasoning": null` for
+    /// models it believes have no reasoning support, so this must tolerate an
+    /// explicit null as well as a missing key.
+    #[serde(default)]
+    pub reasoning: Option<ResponsesReasoning>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// Reasoning block of a Responses request. Only `effort` maps onto Chat
+/// Completions; `summary` has no counterpart there and is intentionally
+/// dropped (reasoning text comes back via `reasoning_content` instead).
+#[derive(Debug, Deserialize, Default)]
 pub struct ResponsesReasoning {
     #[serde(default)]
     pub effort: Option<String>,
@@ -41,6 +45,17 @@ pub enum ResponsesInput {
     /// Each item may be a user/assistant message OR a function_call_output result.
     /// Using Value here lets us handle both without a brittle fixed schema.
     Messages(Vec<Value>),
+}
+
+// Public compatibility type. The binary compiles this module directly but
+// does not construct content parts itself, so it appears unused there.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct ContentPart {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,17 +90,28 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<ChatStreamOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
+    /// Zhipu/GLM thinking switch. Only serialized for GLM-like models so other
+    /// providers keep their existing request shape. GLM suppresses its default
+    /// auto-thinking under heavy agent system prompts (e.g. Codex), so this must
+    /// be sent explicitly for reasoning to be emitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ChatThinking>,
+    /// Reasoning budget, forwarded verbatim from the Responses request's
+    /// `reasoning.effort`. Deliberately a free-form String rather than an enum:
+    /// the accepted set is the upstream's business, not the relay's, and it
+    /// differs per provider (Command Code takes low|medium|high|xhigh|max and
+    /// rejects none/minimal; OpenRouter and OpenAI take other sets). Passing it
+    /// through unchanged means an unsupported value surfaces as the upstream's
+    /// own error instead of being silently rewritten here. Use
+    /// `--drop-upstream-params '["reasoning_effort"]'` to strip it for an
+    /// upstream that chokes on the field entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub stream: bool,
 }
 
@@ -94,7 +120,7 @@ pub struct ChatStreamOptions {
     pub include_usage: bool,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize)]
 pub struct ChatThinking {
     #[serde(rename = "type")]
     pub kind: String,
@@ -206,8 +232,11 @@ pub struct ChatStreamChunk {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatStreamChoice {
+    #[serde(default)]
+    pub index: usize,
     pub delta: ChatDelta,
-    #[allow(dead_code)]
+    /// Upstream end-of-turn signal. Used by stream.rs to tell a provider that
+    /// merely omitted `[DONE]` from a connection that died mid-generation.
     pub finish_reason: Option<String>,
 }
 
@@ -216,10 +245,26 @@ pub struct ChatDelta {
     #[allow(dead_code)]
     pub role: Option<String>,
     pub content: Option<String>,
-    #[serde(default, alias = "reasoning")]
+    /// Thinking content. Providers disagree on the field name: DeepSeek/Kimi/GLM
+    /// use `reasoning_content`; OpenRouter/Together-style (and some newer GLM-5
+    /// deployments) use `reasoning`. Capture both and normalize via
+    /// [`ChatDelta::reasoning_text`].
+    #[serde(default)]
     pub reasoning_content: Option<String>,
     #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
     pub tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+impl ChatDelta {
+    /// Normalized reasoning delta, preferring `reasoning_content` and falling
+    /// back to the `reasoning` alias.
+    pub fn reasoning_text(&self) -> Option<&str> {
+        self.reasoning_content
+            .as_deref()
+            .or(self.reasoning.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

@@ -11,6 +11,37 @@ pub struct NamespaceToolName {
 
 pub type NamespaceToolMap = HashMap<String, NamespaceToolName>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomToolName {
+    pub name: String,
+    pub argument_field: String,
+}
+
+pub type CustomToolMap = HashMap<String, CustomToolName>;
+
+/// Reject tool declarations that collapse to the same Chat Completions name.
+/// The `namespace-name` encoding is not reversible on its own; silently
+/// overwriting one identity could route a call to the wrong namespace and, for
+/// collaboration tools, incorrectly opt it into plaintext argument handling.
+pub fn validate_unique_chat_tool_names(tools: &[Value]) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for tool in convert_tools(tools) {
+        let Some(name) = tool
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if !names.insert(name.to_string()) {
+            return Err(format!(
+                "ambiguous tool name {name:?}: declared more than once"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Convert a Responses API request + prior history into a Chat Completions request.
 pub fn to_chat_request(
     req: &ResponsesRequest,
@@ -19,8 +50,29 @@ pub fn to_chat_request(
 ) -> ChatRequest {
     let mut messages = history;
 
+    // Repair sessions persisted by older relay versions before their invalid
+    // empty argument strings are replayed to a strict upstream provider.
+    for message in &mut messages {
+        complete_message_tool_arguments(message);
+    }
+
+    // History can contain poison blank messages from an earlier turn. Remove
+    // them before deciding whether an existing system prompt suppresses the
+    // current request's instructions. Keep the newest one as a fallback in
+    // case the complete history and input contain nothing else.
+    let mut latest_contentless_fallback = messages
+        .iter()
+        .rev()
+        .find(|msg| is_droppable_contentless(msg))
+        .cloned();
+    messages.retain(|msg| !is_droppable_contentless(msg));
+
     // Prefer `instructions` (Codex CLI) over `system` (other clients).
-    let system_text = req.instructions.as_ref().or(req.system.as_ref());
+    let system_text = req
+        .instructions
+        .as_ref()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| req.system.as_ref().filter(|text| !text.trim().is_empty()));
     if let Some(system) = system_text {
         if messages.is_empty() || messages[0].role != "system" {
             messages.insert(
@@ -40,16 +92,23 @@ pub fn to_chat_request(
     // Append new input, mapping Responses API roles to Chat Completions roles.
     match &req.input {
         ResponsesInput::Text(text) => {
-            messages.push(ChatMessage {
+            let msg = ChatMessage {
                 role: "user".into(),
                 content: Some(Value::String(text.clone())),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
-            });
+            };
+            if is_droppable_contentless(&msg) {
+                latest_contentless_fallback = Some(msg.clone());
+            }
+            messages.push(msg);
         }
         ResponsesInput::Messages(items) => {
+            // Request-scoped custom tool map so replayed custom_tool_call items
+            // are wrapped with the same argument field the tool declared.
+            let custom_tools = custom_tool_map(&req.tools);
             // Collect call_ids already present in history (from previous_response_id).
             // This prevents creating duplicate assistant-with-tool_calls messages
             // when the input items replay function_call entries from prior output.
@@ -66,6 +125,7 @@ pub fn to_chat_request(
                     ids
                 })
                 .collect();
+            let mut seen_call_ids = existing_call_ids.clone();
 
             // For function_call_output dedup, only skip if a tool response
             // already exists for the call_id (not just from assistant tool_calls).
@@ -73,6 +133,7 @@ pub fn to_chat_request(
                 .iter()
                 .filter_map(|msg| msg.tool_call_id.clone())
                 .collect();
+            let mut seen_tool_responses = existing_tool_responses;
 
             // Process items with index so we can group consecutive function_call
             // entries into a single assistant message. Providers require all tool
@@ -82,32 +143,49 @@ pub fn to_chat_request(
                 let item = &items[i];
                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                if item_type == "function_call" {
-                    // Skip function_call items whose call_id already exists in history.
-                    // Duplicates occur when both previous_response_id and input replay
-                    // the same function_call entries from prior output.
-                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                    if existing_call_ids.contains(call_id) {
-                        i += 1;
-                        continue;
-                    }
-                    // Collect this and all immediately following function_call items
+                if is_contentless_response_message(item) {
+                    latest_contentless_fallback = Some(response_message_to_chat(item));
+                    i += 1;
+                    continue;
+                }
+
+                if matches!(item_type, "function_call" | "custom_tool_call") {
+                    // Collect this and all immediately following tool call items
                     // into one assistant message with multiple tool_calls entries.
                     let mut grouped: Vec<Value> = Vec::new();
                     let mut reasoning_content: Option<String> = None;
 
                     while i < items.len() {
                         let cur = &items[i];
-                        if cur.get("type").and_then(|v| v.as_str()).unwrap_or("") != "function_call"
-                        {
+                        let cur_type = cur.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if is_contentless_response_message(cur) {
+                            latest_contentless_fallback = Some(response_message_to_chat(cur));
+                            i += 1;
+                            continue;
+                        }
+                        if !matches!(cur_type, "function_call" | "custom_tool_call") {
                             break;
                         }
                         let call_id = cur.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                        if !seen_call_ids.insert(call_id.to_string()) {
+                            i += 1;
+                            continue;
+                        }
                         let name = response_function_name_for_chat(cur);
-                        let args = cur
-                            .get("arguments")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}");
+                        let args = if cur_type == "custom_tool_call" {
+                            let input = cur.get("input").and_then(Value::as_str).unwrap_or("");
+                            let argument_field = custom_tools
+                                .get(&name)
+                                .map(|tool| tool.argument_field.as_str())
+                                .unwrap_or_else(|| custom_argument_field(&name));
+                            json!({ argument_field: input }).to_string()
+                        } else {
+                            cur.get("arguments")
+                                .and_then(Value::as_str)
+                                .map(completed_tool_arguments)
+                                .unwrap_or("{}")
+                                .to_string()
+                        };
                         if reasoning_content.is_none() {
                             reasoning_content = sessions.get_reasoning(call_id);
                         }
@@ -117,6 +195,10 @@ pub fn to_chat_request(
                             "function": { "name": name, "arguments": args }
                         }));
                         i += 1;
+                    }
+
+                    if grouped.is_empty() {
+                        continue;
                     }
 
                     let mut msg = ChatMessage {
@@ -134,19 +216,23 @@ pub fn to_chat_request(
                     messages.push(msg);
                 } else {
                     match item_type {
-                        "function_call_output" => {
+                        "function_call_output" | "custom_tool_call_output" => {
                             let call_id =
                                 item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                             // Skip function_call_output items if a tool response
-                            // for this call_id already exists in history.
-                            if existing_tool_responses.contains(call_id) {
+                            // for this call_id already exists in history or input.
+                            if !seen_tool_responses.insert(call_id.to_string()) {
                                 i += 1;
                                 continue;
                             }
-                            let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                            let output = match item.get("output") {
+                                Some(Value::String(output)) => output.clone(),
+                                Some(output) => output.to_string(),
+                                None => String::new(),
+                            };
                             messages.push(ChatMessage {
                                 role: "tool".into(),
-                                content: Some(Value::String(output.to_string())),
+                                content: Some(Value::String(output)),
                                 reasoning_content: None,
                                 tool_calls: None,
                                 tool_call_id: Some(call_id.to_string()),
@@ -161,20 +247,7 @@ pub fn to_chat_request(
                         "reasoning" => {}
                         _ => {
                             // Regular user/assistant/developer message
-                            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-                            let role = match role {
-                                "developer" => "system",
-                                other => other,
-                            }
-                            .to_string();
-                            let mut msg = ChatMessage {
-                                role,
-                                content: value_to_chat_content(item.get("content")),
-                                reasoning_content: None,
-                                tool_calls: None,
-                                tool_call_id: None,
-                                name: None,
-                            };
+                            let mut msg = response_message_to_chat(item);
                             // For assistant messages, try to recover reasoning_content
                             // from the turn-level index (needed for thinking models like
                             // DeepSeek that require reasoning_content to be passed back).
@@ -204,122 +277,50 @@ pub fn to_chat_request(
         }
     }
 
+    drop_contentless_messages(&mut messages);
+    if messages.is_empty() {
+        messages.push(latest_contentless_fallback.unwrap_or_else(|| ChatMessage {
+            role: "user".into(),
+            content: Some(Value::String(String::new())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }));
+    }
+
     let mapped_model = map_model_name(&req.model);
-    let requested_effort = req
-        .reasoning
-        .as_ref()
-        .and_then(|reasoning| reasoning.effort.as_deref());
-    let effective_effort = requested_effort.or_else(|| logical_reasoning_default(&req.model));
-    let (thinking, reasoning_effort) =
-        reasoning_controls(&req.model, &mapped_model, effective_effort);
+    // GLM/Zhipu only emits reasoning_content when `thinking` is explicitly
+    // enabled; its default auto-thinking is suppressed by heavy agent system
+    // prompts (e.g. Codex). Other providers (DeepSeek/Kimi) think by default and
+    // must not receive this field, so it stays GLM-gated to preserve their
+    // request shape. See GitHub issue #26 and the quirk registry in quirks.rs.
+    let enable_glm_thinking = crate::quirks::quirk_enabled("glm_thinking")
+        && (crate::quirks::is_glm_like_model(&req.model)
+            || crate::quirks::is_glm_like_model(&mapped_model));
 
     ChatRequest {
         model: mapped_model,
         messages,
         tools: convert_tools(&req.tools),
-        tool_choice: convert_tool_choice(req.tool_choice.as_ref(), &namespace_tool_map(&req.tools)),
         temperature: req.temperature,
         max_tokens: req.max_output_tokens,
         stream_options: req.stream.then_some(ChatStreamOptions {
             include_usage: true,
         }),
-        reasoning_effort,
-        thinking,
-        stream: req.stream,
-    }
-}
-
-fn logical_reasoning_default(model: &str) -> Option<&'static str> {
-    match model {
-        "pulp/instant" => Some("none"),
-        "pulp/brain" | "pulp/think" | "pulp/dream" => Some("high"),
-        _ => None,
-    }
-}
-
-fn is_deepseek_policy_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("deepseek")
-        || matches!(
-            model.as_str(),
-            "pulp/instant" | "pulp/brain" | "pulp/think" | "pulp/dream"
-        )
-}
-
-fn reasoning_controls(
-    requested_model: &str,
-    mapped_model: &str,
-    effort: Option<&str>,
-) -> (Option<ChatThinking>, Option<String>) {
-    let Some(effort) = effort else {
-        return (None, None);
-    };
-    if !is_deepseek_policy_model(requested_model) && !is_deepseek_policy_model(mapped_model) {
-        return (None, Some(effort.to_string()));
-    }
-    if effort.eq_ignore_ascii_case("none") {
-        return (
-            Some(ChatThinking {
-                kind: "disabled".into(),
-            }),
-            None,
-        );
-    }
-    let normalized = if effort.eq_ignore_ascii_case("max") || effort.eq_ignore_ascii_case("xhigh") {
-        "max"
-    } else {
-        "high"
-    };
-    (
-        Some(ChatThinking {
+        thinking: enable_glm_thinking.then(|| ChatThinking {
             kind: "enabled".into(),
         }),
-        Some(normalized.to_string()),
-    )
-}
-
-/// Convert Responses API tool selection into Chat Completions shape.
-///
-/// Responses uses a flat function choice (`{type: "function", name: "foo"}`),
-/// while Chat Completions nests the name under `function`. Namespace tools also
-/// need the same flattened name used by `convert_tools`.
-fn convert_tool_choice(
-    choice: Option<&Value>,
-    namespace_tools: &NamespaceToolMap,
-) -> Option<Value> {
-    let choice = choice?;
-
-    let Value::Object(obj) = choice else {
-        return Some(choice.clone());
-    };
-
-    if obj.get("type").and_then(Value::as_str) != Some("function") {
-        return Some(choice.clone());
+        // Forwarded verbatim; see ChatRequest::reasoning_effort for why the
+        // relay does not validate or remap the value. Absent when Codex sends
+        // `"reasoning": null`, which it does for any model missing from its
+        // model catalog — in that case nothing is added to the upstream body.
+        reasoning_effort: req
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.clone()),
+        stream: req.stream,
     }
-
-    let raw_name = obj
-        .get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
-        .or_else(|| obj.get("name").and_then(Value::as_str));
-    let Some(raw_name) = raw_name else {
-        return Some(choice.clone());
-    };
-
-    let chat_name = if let Some(namespace) = obj.get("namespace").and_then(Value::as_str) {
-        chat_function_name_for_namespace_tool(namespace, raw_name)
-    } else if namespace_tools.contains_key(raw_name) {
-        raw_name.to_string()
-    } else if let Some((namespace, name)) = raw_name.split_once('.') {
-        chat_function_name_for_namespace_tool(namespace, name)
-    } else {
-        raw_name.to_string()
-    };
-
-    Some(json!({
-        "type": "function",
-        "function": { "name": chat_name }
-    }))
 }
 
 /// Map model names via `CODEX_RELAY_MODEL_MAP` env var.
@@ -352,6 +353,7 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
 
 pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
     let mut map = NamespaceToolMap::new();
+    let denied = tool_denylist_from_env();
     for tool in tools {
         if tool.get("type").and_then(Value::as_str) != Some("namespace") {
             continue;
@@ -366,10 +368,13 @@ pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
             if sub.get("type").and_then(Value::as_str) != Some("function") {
                 continue;
             }
-            let Some(name) = sub.get("name").and_then(Value::as_str) else {
+            let Some(name) = declared_function_name(sub) else {
                 continue;
             };
             let chat_name = chat_function_name_for_namespace_tool(namespace, name);
+            if tool_is_denied(sub, Some(&chat_name), &denied) {
+                continue;
+            }
             map.insert(
                 chat_name,
                 NamespaceToolName {
@@ -380,6 +385,166 @@ pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
         }
     }
     map
+}
+
+pub fn custom_tool_map(tools: &[Value]) -> CustomToolMap {
+    let denied = tool_denylist_from_env();
+    let mut map = CustomToolMap::new();
+    for tool in tools {
+        if let Some((name, custom)) = custom_tool_entry(tool, &denied) {
+            map.insert(name, custom);
+        }
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            for sub in tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|sub| sub.get("type").and_then(Value::as_str) == Some("custom"))
+            {
+                if let Some((name, custom)) = custom_tool_entry(sub, &denied) {
+                    map.insert(name, custom);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn custom_tool_entry(tool: &Value, denied: &HashSet<String>) -> Option<(String, CustomToolName)> {
+    let tool_type = tool.get("type").and_then(Value::as_str)?;
+    let name = tool.get("name").and_then(Value::as_str)?;
+    if denied.contains(name) {
+        return None;
+    }
+    let argument_field = match tool_type {
+        "custom" => custom_argument_field(name).to_string(),
+        // Codex CLI declares `apply_patch` as a plain function tool in some
+        // configurations (issue #37), but its handler only accepts
+        // `custom_tool_call` items, so treat it as custom by name. The argument
+        // field follows the declared schema (`patch` in recent Codex CLI,
+        // `input` in the historical JSON tool variant).
+        "function" if name == "apply_patch" => function_tool_string_field(tool)
+            .unwrap_or_else(|| custom_argument_field(name).to_string()),
+        _ => return None,
+    };
+    Some((
+        name.to_string(),
+        CustomToolName {
+            name: name.to_string(),
+            argument_field,
+        },
+    ))
+}
+
+pub(crate) fn chat_tool_names(tools: &[Value]) -> HashSet<String> {
+    tools
+        .iter()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(|tool| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .collect()
+}
+
+pub(crate) fn allowed_upstream_tool_names(
+    declared_tools: &[Value],
+    upstream_body: &Value,
+) -> HashSet<String> {
+    let declared = chat_tool_names(declared_tools);
+    let actual = upstream_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| chat_tool_names(tools))
+        .unwrap_or_default();
+    declared.intersection(&actual).cloned().collect()
+}
+
+pub(crate) fn validate_tool_call_entries<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    allowed_names: &HashSet<String>,
+) -> Result<(), &'static str> {
+    let mut call_ids = HashSet::new();
+    for (call_id, name) in entries {
+        if call_id.is_empty() {
+            return Err("upstream returned an empty tool call ID");
+        }
+        if !call_ids.insert(call_id) {
+            return Err("upstream returned duplicate tool call IDs");
+        }
+        if name.is_empty() || !allowed_names.contains(name) {
+            return Err("upstream returned an undeclared tool call");
+        }
+    }
+    Ok(())
+}
+
+/// Chat Completions providers may omit the arguments delta for a function
+/// whose schema has no parameters. Completed Responses items and replayed
+/// Chat Completions history still require the value to contain valid JSON.
+pub(crate) fn completed_tool_arguments(arguments: &str) -> &str {
+    if arguments.trim().is_empty() {
+        "{}"
+    } else {
+        arguments
+    }
+}
+
+fn complete_message_tool_arguments(message: &mut ChatMessage) {
+    let Some(tool_calls) = message.tool_calls.as_mut() else {
+        return;
+    };
+    for tool_call in tool_calls {
+        let Some(function) = tool_call.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        match function.get("arguments") {
+            Some(Value::String(arguments)) if arguments.trim().is_empty() => {
+                function.insert("arguments".into(), Value::String("{}".into()));
+            }
+            None => {
+                function.insert("arguments".into(), Value::String("{}".into()));
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+fn declared_function_name(tool: &Value) -> Option<&str> {
+    tool.get("name").and_then(Value::as_str).or_else(|| {
+        tool.get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+    })
+}
+
+/// If a Responses API function tool takes a single string parameter, return
+/// that parameter's name.
+fn function_tool_string_field(tool: &Value) -> Option<String> {
+    let properties = tool.get("parameters")?.get("properties")?.as_object()?;
+    if properties.len() != 1 {
+        return None;
+    }
+    let (field, schema) = properties.iter().next()?;
+    (schema.get("type").and_then(Value::as_str) == Some("string")).then(|| field.clone())
+}
+
+fn custom_argument_field(name: &str) -> &'static str {
+    if name == "apply_patch" {
+        "patch"
+    } else {
+        "input"
+    }
+}
+
+pub(crate) fn custom_tool_input(arguments: &str, argument_field: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| value.get(argument_field)?.as_str().map(String::from))
+        .unwrap_or_else(|| arguments.to_string())
 }
 
 fn tool_denylist_from_env() -> HashSet<String> {
@@ -405,22 +570,61 @@ fn convert_tools_with_denylist(tools: &[Value], denied: &HashSet<String>) -> Vec
                 let namespace = tool.get("name").and_then(Value::as_str).unwrap_or("");
                 if let Some(subs) = tool.get("tools").and_then(Value::as_array) {
                     for sub in subs {
-                        if sub.get("type").and_then(Value::as_str) == Some("function") {
-                            let name = sub
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .map(|name| chat_function_name_for_namespace_tool(namespace, name));
-                            if !tool_is_denied(sub, name.as_deref(), denied) {
-                                out.push(convert_tool_with_name(sub, name.as_deref()));
+                        match sub.get("type").and_then(Value::as_str) {
+                            Some("function") => {
+                                let name = sub.get("name").and_then(Value::as_str).map(|name| {
+                                    chat_function_name_for_namespace_tool(namespace, name)
+                                });
+                                if !tool_is_denied(sub, name.as_deref(), denied) {
+                                    out.push(convert_tool_with_name(sub, name.as_deref()));
+                                }
                             }
+                            Some("custom") => {
+                                if let Some(converted) = convert_custom_tool(sub, denied) {
+                                    out.push(converted);
+                                }
+                            }
+                            _ => {}
                         }
                     }
+                }
+            }
+            Some("custom") => {
+                if let Some(converted) = convert_custom_tool(tool, denied) {
+                    out.push(converted);
                 }
             }
             _ => {}
         }
     }
     out
+}
+
+fn convert_custom_tool(tool: &Value, denied: &HashSet<String>) -> Option<Value> {
+    let name = tool.get("name").and_then(Value::as_str)?;
+    if denied.contains(name) {
+        return None;
+    }
+    let argument_field = custom_argument_field(name);
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("Provide the raw custom tool input.");
+    Some(json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    argument_field: {"type": "string"}
+                },
+                "required": [argument_field],
+                "additionalProperties": false
+            }
+        }
+    }))
 }
 
 fn tool_is_denied(tool: &Value, override_name: Option<&str>, denied: &HashSet<String>) -> bool {
@@ -518,7 +722,17 @@ pub fn from_chat_response_with_tool_map(
     chat: ChatResponse,
     namespace_tools: &NamespaceToolMap,
 ) -> (ResponsesResponse, Vec<ChatMessage>) {
-    let choice = chat
+    from_chat_response_with_tool_maps(id, model, chat, namespace_tools, &CustomToolMap::new())
+}
+
+pub fn from_chat_response_with_tool_maps(
+    id: String,
+    model: &str,
+    chat: ChatResponse,
+    namespace_tools: &NamespaceToolMap,
+    custom_tools: &CustomToolMap,
+) -> (ResponsesResponse, Vec<ChatMessage>) {
+    let mut choice = chat
         .choices
         .into_iter()
         .next()
@@ -533,9 +747,38 @@ pub fn from_chat_response_with_tool_map(
             },
         });
 
+    // DeepSeek V4 intermittently leaks DSML tool-call markup into the text
+    // content instead of structured tool_calls; heal it before translation
+    // so the calls execute and the markup never reaches Codex or history.
+    // Quirk `dsml_heal`, see quirks.rs.
+    if crate::quirks::quirk_enabled("dsml_heal") {
+        crate::dsml::heal_chat_message(&mut choice.message);
+    }
+
+    // Reasoning models served without a vLLM reasoning parser leak `<think>`
+    // markup into the text content instead of `reasoning_content`; split it out
+    // so Codex never renders it and history never replays it.
+    // Quirk `think_tags`, see quirks.rs.
+    if crate::quirks::quirk_enabled("think_tags") {
+        crate::think::heal_chat_message(&mut choice.message);
+    }
+
     let usage = chat.usage.unwrap_or_default();
     tracing::debug!("cache(non-stream): {}", usage.cache_summary());
     let mut output = Vec::new();
+
+    if let Some(reasoning) = choice
+        .message
+        .reasoning_content
+        .as_deref()
+        .filter(|reasoning| !reasoning.is_empty())
+    {
+        output.push(json!({
+            "type": "reasoning",
+            "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
+            "summary": [{"type": "summary_text", "text": reasoning}]
+        }));
+    }
 
     let text = choice.message.text_content().to_string();
     if !text.is_empty() || choice.message.tool_calls.is_none() {
@@ -554,24 +797,38 @@ pub fn from_chat_response_with_tool_map(
             let function = tool_call.get("function").unwrap_or(&Value::Null);
             let raw_name = function.get("name").and_then(Value::as_str).unwrap_or("");
             let (namespace, name) = response_function_name_for_responses(raw_name, namespace_tools);
-            let arguments = function
+            let raw_arguments = function
                 .get("arguments")
                 .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let mut item = json!({
-                "type": "function_call",
-                "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
-                "call_id": tool_call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-                "name": name,
-                "arguments": arguments,
-                "status": "completed"
-            });
-            if let Some(namespace) = namespace {
-                item["namespace"] = Value::String(namespace);
-            }
+                .unwrap_or("");
+            let call_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
+            let item = if let Some(custom) = custom_tools.get(raw_name) {
+                json!({
+                    "type": "custom_tool_call",
+                    "id": format!("ctc_{}", uuid::Uuid::new_v4().simple()),
+                    "call_id": call_id,
+                    "name": custom.name,
+                    "input": custom_tool_input(raw_arguments, &custom.argument_field),
+                    "status": "completed"
+                })
+            } else {
+                let arguments = completed_tool_arguments(raw_arguments);
+                let mut item = json!({
+                    "type": "function_call",
+                    "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                    "status": "completed"
+                });
+                if let Some(namespace) = namespace {
+                    if uses_plaintext_collaboration_args(Some(&namespace), &name) {
+                        item["encrypted_function_args"] = json!([]);
+                    }
+                    item["namespace"] = Value::String(namespace);
+                }
+                item
+            };
             output.push(item);
         }
     }
@@ -591,6 +848,7 @@ pub fn from_chat_response_with_tool_map(
         },
     };
 
+    complete_message_tool_arguments(&mut choice.message);
     (response, vec![choice.message])
 }
 
@@ -601,30 +859,101 @@ pub(crate) fn response_function_name_for_responses(
     if let Some(tool_name) = namespace_tools.get(name) {
         return (Some(tool_name.namespace.clone()), tool_name.name.clone());
     }
-    split_mcp_function_name(name)
+    (None, name.to_string())
 }
 
-pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
-    if let Some((namespace, child)) = name.split_once('.') {
-        if !namespace.is_empty() && !child.is_empty() {
-            return (Some(namespace.to_string()), child.to_string());
-        }
-    }
+pub(crate) fn uses_plaintext_collaboration_args(namespace: Option<&str>, name: &str) -> bool {
+    namespace == Some("collaboration")
+        && matches!(name, "spawn_agent" | "send_message" | "followup_task")
+}
 
-    let Some(rest) = name.strip_prefix("mcp__") else {
-        return (None, name.to_string());
-    };
-    let Some(server_end) = rest.find("__") else {
-        return (None, name.to_string());
-    };
-    let split_at = "mcp__".len() + server_end + "__".len();
-    if split_at >= name.len() {
-        return (None, name.to_string());
+/// True when a user/system message would reach the upstream carrying nothing.
+///
+/// `None`, `""`, whitespace, an empty parts array, or a parts array whose text
+/// parts are all blank and which has no image (or other non-text) part.
+fn is_contentless(msg: &ChatMessage) -> bool {
+    is_content_value_contentless(msg.content.as_ref())
+}
+
+fn is_content_value_contentless(content: Option<&Value>) -> bool {
+    match content {
+        None => true,
+        Some(Value::String(text)) => text.trim().is_empty(),
+        Some(Value::Array(parts)) => parts.iter().all(|part| {
+            let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match kind {
+                "text" | "input_text" | "output_text" => part
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.trim().is_empty())
+                    .unwrap_or(true),
+                // Images and unknown part types carry payload; keep them.
+                _ => false,
+            }
+        }),
+        Some(Value::Null) => true,
+        Some(_) => false,
     }
-    (
-        Some(name[..split_at].to_string()),
-        name[split_at..].to_string(),
-    )
+}
+
+fn is_droppable_contentless(msg: &ChatMessage) -> bool {
+    matches!(msg.role.as_str(), "user" | "system")
+        && msg.tool_calls.is_none()
+        && msg.tool_call_id.is_none()
+        && is_contentless(msg)
+}
+
+fn is_contentless_response_message(item: &Value) -> bool {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("message" | "agent_message")
+    ) {
+        return false;
+    }
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    matches!(role, "user" | "system" | "developer")
+        && is_content_value_contentless(item.get("content"))
+}
+
+fn response_message_to_chat(item: &Value) -> ChatMessage {
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    ChatMessage {
+        role: if role == "developer" { "system" } else { role }.to_string(),
+        content: value_to_chat_content(item.get("content")),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    }
+}
+
+/// Drop user/system messages that carry no content at all.
+///
+/// Several Chat Completions upstreams reject the WHOLE request when any
+/// message has empty content — Command Code answers
+/// `400 user message must have content, param=messages.N.content`. Because
+/// Codex replays its full thread history on every turn, one blank message
+/// persisted into that history bricks the thread permanently: every later
+/// turn 400s, the client retries and then closes the turn with no output and
+/// no error anyone can see (observed 2026-08-07, an image-only chat message
+/// that reached Codex as `{"type":"text","text":""}`).
+///
+/// Only user/system messages are eligible. An assistant message with empty
+/// content may still carry `tool_calls`, and a `tool` message is pinned to its
+/// call by `tool_call_id` — dropping either breaks the pairing the Chat
+/// Completions API requires. The last remaining message is never dropped
+/// either: an empty `messages` array is its own 400.
+fn drop_contentless_messages(messages: &mut Vec<ChatMessage>) {
+    if messages.is_empty() {
+        return;
+    }
+    if messages.iter().all(is_droppable_contentless) {
+        let newest = messages.pop().expect("messages is non-empty");
+        messages.clear();
+        messages.push(newest);
+    } else {
+        messages.retain(|msg| !is_droppable_contentless(msg));
+    }
 }
 
 /// Translate a Responses-API `content` value to its Chat Completions equivalent.
@@ -644,6 +973,7 @@ pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
 fn value_to_chat_content(v: Option<&Value>) -> Option<Value> {
     match v {
         None => None,
+        Some(Value::Null) => None,
         Some(Value::String(s)) => Some(Value::String(s.clone())),
         Some(Value::Array(parts)) => {
             // `output_text` is what Codex replays for assistant history items;
@@ -710,14 +1040,61 @@ mod tests {
             input,
             previous_response_id: None,
             tools: vec![],
-            tool_choice: None,
             stream: false,
             temperature: None,
             max_output_tokens: None,
-            reasoning: None,
             system: None,
             instructions: None,
+            reasoning: None,
         }
+    }
+
+    #[test]
+    fn test_reasoning_effort_is_forwarded_verbatim() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hello".into()));
+        req.reasoning = Some(ResponsesReasoning {
+            effort: Some("xhigh".into()),
+        });
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.reasoning_effort.as_deref(), Some("xhigh"));
+        // Serialized shape matters: upstreams read a top-level string field.
+        let body = serde_json::to_value(&chat).unwrap();
+        assert_eq!(body["reasoning_effort"], json!("xhigh"));
+    }
+
+    #[test]
+    fn test_absent_reasoning_omits_the_field() {
+        // Codex sends `"reasoning": null` for any model missing from its model
+        // catalog. Nothing must be added to the upstream body in that case, or
+        // providers that reject unknown fields would start failing.
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Text("hello".into()));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.reasoning_effort.is_none());
+        let body = serde_json::to_value(&chat).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_explicit_null_reasoning_deserializes_to_none() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "deepseek/deepseek-v4-flash",
+            "input": "hi",
+            "reasoning": null,
+        }))
+        .unwrap();
+        assert!(req.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_reasoning_without_effort_forwards_nothing() {
+        // `{"reasoning": {"summary": "auto"}}` carries no budget to forward.
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hello".into()));
+        req.reasoning = Some(ResponsesReasoning { effort: None });
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.reasoning_effort.is_none());
     }
 
     #[test]
@@ -731,64 +1108,123 @@ mod tests {
     }
 
     #[test]
-    fn test_pulp_instant_defaults_to_disabled_thinking() {
+    fn test_blank_user_message_in_history_is_dropped() {
+        // A single blank message persisted in a Codex thread bricked it:
+        // the upstream answered `400 user message must have content` for
+        // EVERY later turn, since Codex replays the whole history.
         let sessions = SessionStore::new();
-        let mut req = base_req(ResponsesInput::Text("hi".into()));
-        req.model = "pulp/instant".into();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": "first"}),
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": ""}]}),
+            json!({"type": "message", "role": "user", "content": "second"}),
+        ]));
         let chat = to_chat_request(&req, vec![], &sessions);
-        assert_eq!(
-            chat.thinking,
-            Some(ChatThinking {
-                kind: "disabled".into()
-            })
-        );
-        assert_eq!(chat.reasoning_effort, None);
+        let texts: Vec<&str> = chat.messages.iter().map(|m| m.text_content()).collect();
+        assert_eq!(texts, vec!["first", "second"]);
     }
 
     #[test]
-    fn test_pulp_think_defaults_to_high_not_auto_max() {
+    fn test_whitespace_only_user_message_is_dropped() {
         let sessions = SessionStore::new();
-        let mut req = base_req(ResponsesInput::Text("hi".into()));
-        req.model = "pulp/think".into();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": "   \n "}),
+            json!({"type": "message", "role": "user", "content": "real"}),
+        ]));
         let chat = to_chat_request(&req, vec![], &sessions);
-        assert_eq!(
-            chat.thinking,
-            Some(ChatThinking {
-                kind: "enabled".into()
-            })
-        );
-        assert_eq!(chat.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].text_content(), "real");
     }
 
     #[test]
-    fn test_pulp_think_preserves_max_effort() {
+    fn test_null_user_message_is_dropped() {
         let sessions = SessionStore::new();
-        let mut req = base_req(ResponsesInput::Text("hi".into()));
-        req.model = "pulp/think".into();
-        req.reasoning = Some(ResponsesReasoning {
-            effort: Some("max".into()),
-        });
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": null}),
+            json!({"type": "message", "role": "user", "content": "real"}),
+        ]));
         let chat = to_chat_request(&req, vec![], &sessions);
-        assert_eq!(
-            chat.thinking,
-            Some(ChatThinking {
-                kind: "enabled".into()
-            })
-        );
-        assert_eq!(chat.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].text_content(), "real");
     }
 
     #[test]
-    fn test_non_deepseek_effort_does_not_invent_thinking_switch() {
+    fn test_image_only_message_is_kept() {
+        // No text, but there IS a payload — dropping it would lose the image.
         let sessions = SessionStore::new();
-        let mut req = base_req(ResponsesInput::Text("hi".into()));
-        req.model = "mock-model".into();
-        req.reasoning = Some(ResponsesReasoning {
-            effort: Some("low".into()),
-        });
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": ""},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
+            ]
+        })]));
         let chat = to_chat_request(&req, vec![], &sessions);
-        assert_eq!(chat.thinking, None);
-        assert_eq!(chat.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(chat.messages.len(), 1);
+        assert!(chat.messages[0].content.as_ref().unwrap().is_array());
+    }
+
+    #[test]
+    fn test_assistant_message_with_tool_calls_and_no_content_is_kept() {
+        // Empty content is legal — and required — for a tool-calling turn.
+        let mut messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![json!({"id": "c1"})]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(Value::String(String::new())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+                name: None,
+            },
+        ];
+        drop_contentless_messages(&mut messages);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_never_empties_the_message_array() {
+        // An all-blank request must still be a well-formed one; let the
+        // upstream decide, rather than sending zero messages.
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(Value::String(String::new())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        drop_contentless_messages(&mut messages);
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn test_all_blank_messages_keep_only_the_newest() {
+        let mut messages = ["first", "second", "newest"]
+            .into_iter()
+            .map(|name| ChatMessage {
+                role: "user".into(),
+                content: Some(Value::String(if name == "newest" {
+                    "\n".into()
+                } else {
+                    String::new()
+                })),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: Some(name.into()),
+            })
+            .collect();
+        drop_contentless_messages(&mut messages);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].name.as_deref(), Some("newest"));
     }
 
     #[test]
@@ -799,6 +1235,91 @@ mod tests {
         let chat = to_chat_request(&req, vec![], &sessions);
         assert_eq!(chat.messages[0].role, "system");
         assert_eq!(chat.messages[0].text_content(), "be helpful");
+    }
+
+    #[test]
+    fn test_blank_developer_input_does_not_replace_instructions() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "developer", "content": "  "}),
+            json!({"type": "message", "role": "user", "content": "hi"}),
+        ]));
+        req.instructions = Some("be helpful".into());
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages[0].role, "system");
+        assert_eq!(chat.messages[0].text_content(), "be helpful");
+    }
+
+    #[test]
+    fn test_only_blank_developer_input_is_kept_as_fallback() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "message",
+            "role": "developer",
+            "content": " \n "
+        })]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "system");
+        assert_eq!(chat.messages[0].content, Some(json!(" \n ")));
+    }
+
+    #[test]
+    fn test_newer_blank_input_wins_over_blank_history_fallback() {
+        let sessions = SessionStore::new();
+        let history = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(json!(" \t")),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "message",
+            "role": "developer",
+            "content": " \n "
+        })]));
+        let chat = to_chat_request(&req, history, &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "system");
+        assert_eq!(chat.messages[0].content, Some(json!(" \n ")));
+    }
+
+    #[test]
+    fn test_empty_input_still_produces_one_message() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "user");
+    }
+
+    #[test]
+    fn test_blank_history_system_does_not_suppress_instructions() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.instructions = Some("current instructions".into());
+        let history = vec![ChatMessage {
+            role: "system".into(),
+            content: Some(String::new().into()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let chat = to_chat_request(&req, history, &sessions);
+        assert_eq!(chat.messages[0].text_content(), "current instructions");
+    }
+
+    #[test]
+    fn test_blank_instructions_fall_back_to_system() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.instructions = Some(" \n".into());
+        req.system = Some("system fallback".into());
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages[0].text_content(), "system fallback");
     }
 
     #[test]
@@ -829,6 +1350,95 @@ mod tests {
     }
 
     #[test]
+    fn test_blank_messages_do_not_split_parallel_tool_calls() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "fn_a", "arguments": "{}"}),
+            json!({"type": "message", "role": "user", "content": ""}),
+            json!({"type": "message", "role": "system", "content": []}),
+            json!({"type": "function_call", "call_id": "c2", "name": "fn_b", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "one"}),
+            json!({"type": "function_call_output", "call_id": "c2", "output": "two"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 3);
+        let calls = chat.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "c1");
+        assert_eq!(calls[1]["id"], "c2");
+        assert_eq!(chat.messages[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(chat.messages[2].tool_call_id.as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn test_duplicate_tool_call_ids_across_blank_messages_are_skipped() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "first", "arguments": "{}"}),
+            json!({"type": "message", "role": "user", "content": ""}),
+            json!({"type": "function_call", "call_id": "c1", "name": "duplicate", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "one"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "duplicate output"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 2);
+        let calls = chat.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "first");
+        assert_eq!(chat.messages[1].text_content(), "one");
+    }
+
+    #[test]
+    fn test_duplicate_tool_call_in_later_group_does_not_create_empty_assistant() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "first", "arguments": "{}"}),
+            json!({"type": "message", "role": "developer", "content": "rules"}),
+            json!({"type": "function_call", "call_id": "c1", "name": "duplicate", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "done"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        let roles: Vec<&str> = chat.messages.iter().map(|msg| msg.role.as_str()).collect();
+        assert_eq!(roles, ["system", "assistant", "tool"]);
+        assert_eq!(chat.messages[1].tool_calls.as_ref().unwrap().len(), 1);
+        assert!(chat.messages.iter().all(|msg| msg
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| !calls.is_empty())));
+    }
+
+    #[test]
+    fn test_custom_tool_call_and_output_replay_as_chat_messages() {
+        let sessions = SessionStore::new();
+        let patch = "*** Begin Patch\n*** End Patch";
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": patch
+            }),
+            json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call_patch",
+                "output": "Done!"
+            }),
+        ]));
+
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 2);
+        let call = &chat.messages[0].tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call["function"]["name"], "apply_patch");
+        assert_eq!(
+            serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap(),
+            json!({"patch": patch})
+        );
+        assert_eq!(chat.messages[1].role, "tool");
+        assert_eq!(chat.messages[1].tool_call_id.as_deref(), Some("call_patch"));
+        assert_eq!(chat.messages[1].text_content(), "Done!");
+    }
+
+    #[test]
     fn test_namespaced_function_call_replays_to_flattened_chat_name() {
         let sessions = SessionStore::new();
         let req = base_req(ResponsesInput::Messages(vec![json!({
@@ -847,53 +1457,8 @@ mod tests {
     }
 
     #[test]
-    fn test_required_flat_function_choice_becomes_chat_choice() {
-        let sessions = SessionStore::new();
-        let mut req = base_req(ResponsesInput::Text("hello".into()));
-        req.tools = vec![json!({
-            "type": "function",
-            "name": "get_probe_value",
-            "parameters": {"type": "object"}
-        })];
-        req.tool_choice = Some(json!({"type": "function", "name": "get_probe_value"}));
-
-        let chat = to_chat_request(&req, vec![], &sessions);
-        assert_eq!(
-            chat.tool_choice,
-            Some(json!({
-                "type": "function",
-                "function": {"name": "get_probe_value"}
-            }))
-        );
-    }
-
-    #[test]
-    fn test_required_namespaced_function_choice_uses_chat_name() {
-        let sessions = SessionStore::new();
-        let mut req = base_req(ResponsesInput::Text("hello".into()));
-        req.tools = vec![json!({
-            "type": "namespace",
-            "name": "mcp__node_repl",
-            "tools": [{"type": "function", "name": "status"}]
-        })];
-        req.tool_choice = Some(json!({
-            "type": "function",
-            "namespace": "mcp__node_repl",
-            "name": "status"
-        }));
-
-        let chat = to_chat_request(&req, vec![], &sessions);
-        assert_eq!(
-            chat.tool_choice,
-            Some(json!({
-                "type": "function",
-                "function": {"name": "mcp__node_repl-status"}
-            }))
-        );
-    }
-
-    #[test]
     fn test_from_chat_response_uses_request_tool_map_for_namespace() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let chat = ChatResponse {
             choices: vec![ChatChoice {
                 message: ChatMessage {
@@ -928,6 +1493,63 @@ mod tests {
         assert_eq!(resp.output[0]["namespace"], "mcp__node_repl");
         assert_eq!(resp.output[0]["name"], "status");
         assert_eq!(resp.output[0]["call_id"], "call_status");
+    }
+
+    #[test]
+    fn test_collaboration_calls_request_plaintext_arguments() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let call_names = [
+            "collaboration-spawn_agent",
+            "collaboration-send_message",
+            "collaboration-followup_task",
+            "collaboration-wait",
+            "unrelated",
+        ];
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(
+                        call_names
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                json!({
+                                    "id": format!("call_{index}"),
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": "{}"}
+                                })
+                            })
+                            .collect(),
+                    ),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+        let tools = vec![json!({
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [
+                {"type": "function", "name": "spawn_agent"},
+                {"type": "function", "name": "send_message"},
+                {"type": "function", "name": "followup_task"},
+                {"type": "function", "name": "wait"}
+            ]
+        })];
+        let namespace_tools = namespace_tool_map(&tools);
+
+        let (resp, _) =
+            from_chat_response_with_tool_map("resp_1".into(), "test-model", chat, &namespace_tools);
+        for item in &resp.output[..3] {
+            assert_eq!(item["namespace"], "collaboration");
+            assert_eq!(item["encrypted_function_args"], json!([]));
+        }
+        assert!(resp.output[3].get("encrypted_function_args").is_none());
+        assert!(resp.output[4].get("encrypted_function_args").is_none());
     }
 
     #[test]
@@ -987,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_chat_response_keeps_legacy_dot_namespace_split() {
+    fn test_unmapped_dot_name_is_not_promoted_to_namespace() {
         let chat = ChatResponse {
             choices: vec![ChatChoice {
                 message: ChatMessage {
@@ -1010,8 +1632,9 @@ mod tests {
         };
 
         let (resp, _) = from_chat_response("resp_1".into(), "test-model", chat);
-        assert_eq!(resp.output[0]["namespace"], "mcp__node_repl");
-        assert_eq!(resp.output[0]["name"], "status");
+        assert!(resp.output[0].get("namespace").is_none());
+        assert!(resp.output[0].get("encrypted_function_args").is_none());
+        assert_eq!(resp.output[0]["name"], "mcp__node_repl.status");
     }
 
     #[test]
@@ -1024,6 +1647,18 @@ mod tests {
         assert_eq!(chat.messages[0].role, "tool");
         assert_eq!(chat.messages[0].text_content(), "result");
         assert_eq!(chat.messages[0].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn test_non_string_function_call_output_is_not_lost() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": {"ok": true, "count": 2}
+        })]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages[0].text_content(), r#"{"count":2,"ok":true}"#);
     }
 
     #[test]
@@ -1069,6 +1704,186 @@ mod tests {
     }
 
     #[test]
+    fn test_namespace_custom_tool_uses_bare_name_and_round_trips_as_custom() {
+        let tools = vec![json!({
+            "type": "namespace",
+            "name": "functions",
+            "tools": [
+                {"type": "custom", "name": "exec", "description": "Run code"},
+                {"type": "function", "name": "wait", "parameters": {"type": "object"}}
+            ]
+        })];
+
+        let converted = convert_tools_with_denylist(&tools, &HashSet::new());
+        let names: Vec<&str> = converted
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, ["exec", "functions-wait"]);
+        assert_eq!(
+            converted[0]["function"]["parameters"]["required"],
+            json!(["input"])
+        );
+
+        let namespace_tools = namespace_tool_map(&tools);
+        let custom_tools = custom_tool_map(&tools);
+        assert!(!namespace_tools.contains_key("exec"));
+        assert!(custom_tools.contains_key("exec"));
+
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_exec",
+                        "type": "function",
+                        "function": {
+                            "name": "exec",
+                            "arguments": "{\"input\":\"ls\"}"
+                        }
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+        let (response, _) = from_chat_response_with_tool_maps(
+            "resp_exec".into(),
+            "model",
+            chat,
+            &namespace_tools,
+            &custom_tools,
+        );
+        assert_eq!(response.output[0]["type"], "custom_tool_call");
+        assert_eq!(response.output[0]["name"], "exec");
+        assert_eq!(response.output[0]["input"], "ls");
+        assert!(response.output[0].get("namespace").is_none());
+    }
+
+    #[test]
+    fn test_rejects_nested_custom_bare_name_collision() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let nested_custom = json!({
+            "type": "namespace",
+            "name": "functions",
+            "tools": [{"type": "custom", "name": "exec"}]
+        });
+        for conflicting in [
+            json!({"type": "custom", "name": "exec"}),
+            json!({"type": "function", "name": "exec"}),
+            json!({
+                "type": "namespace",
+                "name": "other",
+                "tools": [{"type": "custom", "name": "exec"}]
+            }),
+        ] {
+            let tools = vec![conflicting, nested_custom.clone()];
+
+            let error = validate_unique_chat_tool_names(&tools).unwrap_err();
+            assert!(error.contains("exec"));
+        }
+    }
+
+    #[test]
+    fn test_denylist_filters_nested_custom_from_tools_and_reverse_map() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tools = vec![json!({
+            "type": "namespace",
+            "name": "functions",
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "function", "name": "wait"}
+            ]
+        })];
+        std::env::set_var("CODEX_RELAY_TOOL_DENYLIST", "exec");
+
+        let converted = convert_tools(&tools);
+        let names: Vec<&str> = converted
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, ["functions-wait"]);
+        assert!(!custom_tool_map(&tools).contains_key("exec"));
+
+        std::env::remove_var("CODEX_RELAY_TOOL_DENYLIST");
+    }
+
+    #[test]
+    fn test_rejects_flat_and_namespace_tool_name_collision() {
+        let tools = vec![
+            json!({"type": "function", "name": "collaboration-spawn_agent"}),
+            json!({
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{"type": "function", "name": "spawn_agent"}]
+            }),
+        ];
+
+        let error = validate_unique_chat_tool_names(&tools).unwrap_err();
+        assert!(error.contains("collaboration-spawn_agent"));
+    }
+
+    #[test]
+    fn test_rejects_nested_chat_and_namespace_tool_name_collision() {
+        let tools = vec![
+            json!({
+                "type": "function",
+                "function": {"name": "collaboration-spawn_agent"}
+            }),
+            json!({
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{"type": "function", "name": "spawn_agent"}]
+            }),
+        ];
+
+        let error = validate_unique_chat_tool_names(&tools).unwrap_err();
+        assert!(error.contains("collaboration-spawn_agent"));
+    }
+
+    #[test]
+    fn test_rejects_namespace_tool_name_collision() {
+        let tools = vec![
+            json!({
+                "type": "namespace",
+                "name": "a",
+                "tools": [{"type": "function", "name": "b-c"}]
+            }),
+            json!({
+                "type": "namespace",
+                "name": "a-b",
+                "tools": [{"type": "function", "name": "c"}]
+            }),
+        ];
+
+        let error = validate_unique_chat_tool_names(&tools).unwrap_err();
+        assert!(error.contains("a-b-c"));
+    }
+
+    #[test]
+    fn test_denylisted_collision_is_removed_from_tools_and_reverse_map() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tools = vec![
+            json!({"type": "function", "name": "collaboration-spawn_agent"}),
+            json!({
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{"type": "function", "name": "spawn_agent"}]
+            }),
+        ];
+        std::env::set_var("CODEX_RELAY_TOOL_DENYLIST", "collaboration-spawn_agent");
+
+        assert!(validate_unique_chat_tool_names(&tools).is_ok());
+        assert!(convert_tools(&tools).is_empty());
+        assert!(namespace_tool_map(&tools).is_empty());
+
+        std::env::remove_var("CODEX_RELAY_TOOL_DENYLIST");
+    }
+
+    #[test]
     fn test_convert_tools_denylist_filters_flat_and_namespaced_tools() {
         let tools = vec![
             json!({"type": "function", "name": "spawn_agent"}),
@@ -1095,6 +1910,196 @@ mod tests {
             .collect();
 
         assert_eq!(names, ["exec_command", "mcp__server-allowed"]);
+    }
+
+    #[test]
+    fn test_tool_call_validation_rejects_undeclared_duplicate_and_empty_ids() {
+        let allowed = HashSet::from(["allowed".to_string()]);
+        assert_eq!(
+            validate_tool_call_entries([("call_1", "undeclared")], &allowed),
+            Err("upstream returned an undeclared tool call")
+        );
+        assert_eq!(
+            validate_tool_call_entries([("", "allowed")], &allowed),
+            Err("upstream returned an empty tool call ID")
+        );
+        assert_eq!(
+            validate_tool_call_entries([("call_1", "allowed"), ("call_1", "allowed")], &allowed),
+            Err("upstream returned duplicate tool call IDs")
+        );
+        assert!(validate_tool_call_entries(
+            [("call_1", "allowed"), ("call_2", "allowed")],
+            &allowed
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_empty_completed_tool_arguments_become_json_object() {
+        assert_eq!(completed_tool_arguments(""), "{}");
+        assert_eq!(completed_tool_arguments(" \n\t"), "{}");
+        assert_eq!(completed_tool_arguments("{malformed"), "{malformed");
+    }
+
+    #[test]
+    fn test_non_string_tool_arguments_are_not_silently_rewritten() {
+        let mut message = ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_bad",
+                "type": "function",
+                "function": {"name": "bad", "arguments": {"unexpected": true}}
+            })]),
+            tool_call_id: None,
+            name: None,
+        };
+
+        complete_message_tool_arguments(&mut message);
+        assert_eq!(
+            message.tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            json!({"unexpected": true})
+        );
+    }
+
+    #[test]
+    fn test_empty_function_call_arguments_are_repaired_during_replay() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "function_call",
+            "call_id": "call_empty",
+            "name": "no_args",
+            "arguments": ""
+        })]));
+
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(
+            chat.messages[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_empty_arguments_in_retained_history_are_repaired_before_duplicate_input() {
+        let sessions = SessionStore::new();
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_old",
+                "type": "function",
+                "function": {"name": "no_args", "arguments": ""}
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "function_call",
+            "call_id": "call_old",
+            "name": "no_args",
+            "arguments": ""
+        })]));
+
+        let chat = to_chat_request(&req, history, &sessions);
+        assert_eq!(
+            chat.messages.len(),
+            1,
+            "duplicate input call must be skipped"
+        );
+        assert_eq!(
+            chat.messages[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_empty_blocking_tool_arguments_are_completed_as_json_object() {
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_empty",
+                        "type": "function",
+                        "function": {"name": "no_args", "arguments": ""}
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+
+        let (response, history) = from_chat_response("resp_empty".into(), "model", chat);
+        assert_eq!(response.output[0]["arguments"], "{}");
+        assert_eq!(
+            history[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_empty_blocking_custom_tool_arguments_remain_empty_input() {
+        let tools = vec![json!({"type": "custom", "name": "custom_empty"})];
+        let custom_tools = custom_tool_map(&tools);
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_custom",
+                        "type": "function",
+                        "function": {"name": "custom_empty", "arguments": ""}
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+
+        let (response, history) = from_chat_response_with_tool_maps(
+            "resp_custom".into(),
+            "model",
+            chat,
+            &NamespaceToolMap::new(),
+            &custom_tools,
+        );
+        assert_eq!(response.output[0]["type"], "custom_tool_call");
+        assert_eq!(response.output[0]["input"], "");
+        assert_eq!(
+            history[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            "{}",
+            "chat history still requires valid JSON"
+        );
+    }
+
+    #[test]
+    fn test_allowed_tools_intersect_declared_and_final_upstream_body() {
+        let declared = vec![
+            json!({"type": "function", "function": {"name": "kept"}}),
+            json!({"type": "function", "function": {"name": "removed"}}),
+        ];
+        let upstream_body = json!({
+            "tools": [
+                {"type": "function", "function": {"name": "kept"}},
+                {"type": "function", "function": {"name": "injected"}},
+                {"type": "web_search", "function": {"name": "removed"}},
+                {"function": {"name": "removed"}}
+            ]
+        });
+
+        assert_eq!(
+            allowed_upstream_tool_names(&declared, &upstream_body),
+            HashSet::from(["kept".to_string()])
+        );
+        assert!(allowed_upstream_tool_names(&declared, &json!({})).is_empty());
     }
 
     #[test]
@@ -1191,6 +2196,21 @@ mod tests {
         let chat = to_chat_request(&req, vec![], &sessions);
         assert!(chat.messages[0].content.as_ref().unwrap().is_string());
         assert_eq!(chat.messages[0].text_content(), "hi");
+    }
+
+    #[test]
+    fn test_agent_message_plaintext_input_reaches_chat_upstream() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+        "type": "agent_message",
+        "author": "agent-a",
+        "recipient": "agent-b",
+        "content": [
+            {"type": "input_text", "text": "do the task"}
+        ]})]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.messages[0].content.as_ref().unwrap().is_string());
+        assert_eq!(chat.messages[0].text_content(), "do the task");
     }
 
     #[test]
