@@ -7,7 +7,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{header, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -738,6 +738,145 @@ async fn post_stream_events(relay: &Relay, body: Value) -> Vec<(String, Value)> 
     }
 
     panic!("terminal response event");
+}
+
+#[derive(Clone)]
+struct HeaderCaptureState(Arc<Mutex<Vec<axum::http::HeaderMap>>>);
+
+async fn header_capture_upstream(
+    State(state): State<HeaderCaptureState>,
+    request: axum::extract::Request,
+) -> Response {
+    let headers = request.headers().clone();
+    let body = match axum::body::to_bytes(request.into_body(), 1_000_000).await {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes).expect("chat request json"),
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("bad body"))
+                .unwrap();
+        }
+    };
+    state.0.lock().unwrap().push(headers);
+
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(default_ok_sse()))
+            .unwrap()
+    } else {
+        axum::Json(json!({
+            "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .into_response()
+    }
+}
+
+async fn spawn_header_capture_upstream() -> (u16, Arc<Mutex<Vec<axum::http::HeaderMap>>>) {
+    let headers = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1/models", get(models_handler))
+        .route("/v1/chat/completions", post(header_capture_upstream))
+        .with_state(HeaderCaptureState(headers.clone()));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind mock upstream");
+    let port = listener.local_addr().expect("mock upstream addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock upstream serve");
+    });
+    (port, headers)
+}
+
+#[tokio::test]
+async fn forwards_scoped_bifrost_identity_headers_on_streaming_and_blocking_requests() {
+    let (upstream_port, captured) = spawn_header_capture_upstream().await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+    let client = reqwest::Client::new();
+    let headers = [
+        ("authorization", "Bearer principal-vk"),
+        ("x-bf-eh-user-agent", "codex-cli/0.200.0"),
+        ("x-bf-eh-x-opencode-client", "codex"),
+        ("x-bf-eh-x-opencode-project", "project-123"),
+        ("x-bf-eh-x-opencode-request", "request-123"),
+        ("x-bf-eh-x-opencode-session", "pulp-session-123"),
+        ("x-bf-passthrough-extra-params", "true"),
+        ("x-bf-eh-authorization", "must-not-forward"),
+    ];
+
+    let streamed = client
+        .post(relay.url("/v1/responses"))
+        .headers(
+            headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        reqwest::header::HeaderName::from_static(name),
+                        reqwest::header::HeaderValue::from_static(value),
+                    )
+                })
+                .collect(),
+        )
+        .json(&json!({"model":"deepseek-v4.1-flash", "input":"hello", "stream":true}))
+        .send()
+        .await
+        .expect("streaming relay request");
+    assert!(streamed.status().is_success());
+    assert!(streamed
+        .text()
+        .await
+        .expect("stream body")
+        .contains("response.completed"));
+
+    let blocking = client
+        .post(relay.url("/v1/responses"))
+        .headers(
+            headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        reqwest::header::HeaderName::from_static(name),
+                        reqwest::header::HeaderValue::from_static(value),
+                    )
+                })
+                .collect(),
+        )
+        .json(&json!({"model":"deepseek-v4.1-flash", "input":"hello", "stream":false}))
+        .send()
+        .await
+        .expect("blocking relay request");
+    assert!(blocking.status().is_success());
+
+    let forwarded = captured.lock().unwrap();
+    assert_eq!(forwarded.len(), 2);
+    for request in forwarded.iter() {
+        assert_eq!(request.get("authorization").unwrap(), "Bearer principal-vk");
+        assert_eq!(
+            request.get("x-bf-eh-user-agent").unwrap(),
+            "codex-cli/0.200.0"
+        );
+        assert_eq!(request.get("x-bf-eh-x-opencode-client").unwrap(), "codex");
+        assert_eq!(
+            request.get("x-bf-eh-x-opencode-project").unwrap(),
+            "project-123"
+        );
+        assert_eq!(
+            request.get("x-bf-eh-x-opencode-request").unwrap(),
+            "request-123"
+        );
+        assert_eq!(
+            request.get("x-bf-eh-x-opencode-session").unwrap(),
+            "pulp-session-123"
+        );
+        assert_eq!(
+            request.get("x-bf-passthrough-extra-params").unwrap(),
+            "true"
+        );
+        assert!(request.get("x-bf-eh-authorization").is_none());
+    }
 }
 
 struct Relay {

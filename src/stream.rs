@@ -1,7 +1,10 @@
 use async_stream::stream;
-use axum::response::{
-    sse::{Event, KeepAlive},
-    Sse,
+use axum::{
+    http::HeaderMap,
+    response::{
+        sse::{Event, KeepAlive},
+        Sse,
+    },
 };
 use eventsource_stream::Eventsource as EventsourceExt;
 use futures_util::StreamExt;
@@ -29,6 +32,7 @@ pub struct StreamArgs {
     pub client: reqwest::Client,
     pub url: String,
     pub authorization: Option<String>,
+    pub bifrost_headers: HeaderMap,
     pub chat_req: ChatRequest,
     pub upstream_request: Arc<UpstreamRequestConfig>,
     pub response_id: String,
@@ -107,6 +111,7 @@ pub fn translate_stream(
         client,
         url,
         authorization,
+        bifrost_headers,
         chat_req,
         upstream_request,
         response_id,
@@ -132,6 +137,9 @@ pub fn translate_stream(
         let mut builder = client.post(&url).header("Content-Type", "application/json");
         if let Some(authorization) = authorization.as_deref() {
             builder = builder.header("Authorization", authorization);
+        }
+        for (name, value) in &bifrost_headers {
+            builder = builder.header(name, value);
         }
 
         let upstream_body = match upstream_request.request_body(&chat_req) {

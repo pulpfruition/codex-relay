@@ -11,7 +11,7 @@ mod upstream_request;
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -26,6 +26,25 @@ use types::*;
 use upstream_request::UpstreamRequestConfig;
 
 const DEBUG_NAME_LIMIT: usize = 80;
+const BIFROST_REQUEST_HEADERS: [&str; 6] = [
+    "x-bf-eh-user-agent",
+    "x-bf-eh-x-opencode-client",
+    "x-bf-eh-x-opencode-project",
+    "x-bf-eh-x-opencode-request",
+    "x-bf-eh-x-opencode-session",
+    "x-bf-passthrough-extra-params",
+];
+
+fn bifrost_request_headers(headers: &HeaderMap) -> HeaderMap {
+    BIFROST_REQUEST_HEADERS
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .map(|value| (HeaderName::from_static(*name), value.clone()))
+        })
+        .collect()
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -784,6 +803,7 @@ async fn handle_responses(
     body: axum::body::Bytes,
 ) -> Response {
     let authorization = request_authorization(&headers);
+    let bifrost_headers = bifrost_request_headers(&headers);
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -813,13 +833,14 @@ async fn handle_responses(
         summarize_debug_names(response_tool_debug_names(&req.tools))
     );
 
-    handle_responses_inner(state, req, authorization).await
+    handle_responses_inner(state, req, authorization, bifrost_headers).await
 }
 
 async fn handle_responses_inner(
     state: AppState,
     mut req: ResponsesRequest,
     authorization: Option<String>,
+    bifrost_headers: HeaderMap,
 ) -> Response {
     if let Err(message) = translate::validate_unique_chat_tool_names(&req.tools) {
         return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
@@ -856,6 +877,7 @@ async fn handle_responses_inner(
             client: state.client,
             url,
             authorization: authorization.clone(),
+            bifrost_headers: bifrost_headers.clone(),
             chat_req,
             upstream_request: state.upstream_request,
             response_id,
@@ -879,6 +901,7 @@ async fn handle_responses_inner(
             custom_tools,
             previous_response_id,
             authorization,
+            bifrost_headers,
         )
         .await
     }
@@ -1184,6 +1207,7 @@ async fn handle_blocking(
     custom_tools: translate::CustomToolMap,
     previous_response_id: Option<String>,
     authorization: Option<String>,
+    bifrost_headers: HeaderMap,
 ) -> Response {
     let mut builder = state
         .client
@@ -1192,6 +1216,9 @@ async fn handle_blocking(
 
     if let Some(authorization) = authorization {
         builder = builder.header("Authorization", authorization);
+    }
+    for (name, value) in &bifrost_headers {
+        builder = builder.header(name, value);
     }
 
     let upstream_body = match state.upstream_request.request_body(&chat_req) {
